@@ -1,3 +1,4 @@
+print("=== MailNotifier API v3.0 - MONITOR ACTIF ===")
 import os
 import time
 import random
@@ -986,13 +987,19 @@ def monitor_test():
 # ─── STARTUP (fonctionne avec gunicorn ET python api.py) ─────────────────────
 
 def _startup():
+    print("[STARTUP] Debut de l'initialisation...")
     try:
         init_db()
         notifier_status["running"] = True
+        print("[STARTUP] Lancement thread TelegramBot...")
         threading.Thread(target=telegram_bot_polling, daemon=True, name="tg-bot").start()
+        print("[STARTUP] Lancement thread email-monitor...")
         threading.Thread(target=monitor_emails_loop, daemon=True, name="email-monitor").start()
+        print("[STARTUP] Tous les threads lances avec succes.")
     except Exception as e:
-        print(f"[STARTUP] Erreur: {e}")
+        import traceback
+        print(f"[STARTUP] ERREUR CRITIQUE: {e}")
+        traceback.print_exc()
 
 _startup()
 
