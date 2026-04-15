@@ -143,6 +143,8 @@ def init_db():
             """)
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_token TEXT")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_history_id VARCHAR(50)")
+            # Promouvoir l'admin principal
+            cur.execute("UPDATE users SET role='admin' WHERE email='kyliyanisse@gmail.com'")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS otp_codes (
                     id SERIAL PRIMARY KEY,
@@ -405,7 +407,14 @@ def admin_get_users():
     db = get_db()
     try:
         with db.cursor() as cur:
-            cur.execute("SELECT id, name, email, is_verified, role, plan, created_at FROM users ORDER BY created_at DESC")
+            cur.execute("""
+                SELECT id, name, email, is_verified, role, plan, phone,
+                       gmail_address, telegram_chat_id, green_api_instance,
+                       CASE WHEN gmail_token IS NOT NULL THEN TRUE ELSE FALSE END as gmail_connected,
+                       CASE WHEN last_history_id IS NOT NULL THEN TRUE ELSE FALSE END as monitor_active,
+                       created_at
+                FROM users ORDER BY created_at DESC
+            """)
             rows = cur.fetchall()
             users = []
             for u in rows:
