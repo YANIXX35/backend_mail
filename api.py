@@ -914,6 +914,75 @@ def monitor_emails_loop():
         time.sleep(30)
 
 
+# ─── DEBUG / TEST ENDPOINT ────────────────────────────────────────────────────
+
+@app.route('/api/monitor/test')
+def monitor_test():
+    """Endpoint de debug : lance un cycle de check et retourne les détails."""
+    logs = []
+
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                SELECT id, email, telegram_chat_id, last_history_id,
+                       (gmail_token IS NOT NULL) as has_token
+                FROM users WHERE is_verified = 1
+            """)
+            all_users = [dict(u) for u in cur.fetchall()]
+    finally:
+        db.close()
+
+    logs.append(f"Total utilisateurs: {len(all_users)}")
+    for u in all_users:
+        logs.append(
+            f"  - {u['email']} | telegram={u['telegram_chat_id']} | "
+            f"gmail_token={'OUI' if u['has_token'] else 'NON'} | "
+            f"last_history_id={u['last_history_id']}"
+        )
+
+    # Utilisateurs éligibles pour la surveillance
+    eligible = [u for u in all_users if u['has_token'] and u['telegram_chat_id']]
+    logs.append(f"Eligibles (token + telegram): {len(eligible)}")
+
+    for user in eligible:
+        service = get_gmail_service_for(user['email'])
+        if not service:
+            logs.append(f"  ⚠ {user['email']}: service Gmail indisponible (token invalide ?)")
+            continue
+
+        if not user['last_history_id']:
+            try:
+                profile = service.users().getProfile(userId='me').execute()
+                hist_id = str(profile.get('historyId', ''))
+                _save_history_id(user['id'], hist_id)
+                logs.append(f"  ✓ {user['email']}: historyId initialisé à {hist_id}")
+            except Exception as e:
+                logs.append(f"  ✗ {user['email']}: erreur init historyId: {e}")
+            continue
+
+        # Teste l'envoi Telegram directement
+        test_text = (
+            f"\U0001f4e7 *Test MailNotifier*\n\n"
+            f"Le systeme de notification fonctionne correctement !\n"
+            f"_Compte surveille : {user['email']}_"
+        )
+        try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": user['telegram_chat_id'], "text": test_text, "parse_mode": "Markdown"},
+                timeout=10
+            )
+            if resp.ok:
+                logs.append(f"  ✓ {user['email']}: message Telegram ENVOYE (chat_id={user['telegram_chat_id']})")
+            else:
+                logs.append(f"  ✗ {user['email']}: Telegram erreur {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            logs.append(f"  ✗ {user['email']}: Telegram exception: {e}")
+
+    return jsonify({"logs": logs, "token_ok": bool(TELEGRAM_BOT_TOKEN)}), 200
+
+
 # ─── STARTUP (fonctionne avec gunicorn ET python api.py) ─────────────────────
 
 def _startup():
