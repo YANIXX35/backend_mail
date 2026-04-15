@@ -58,6 +58,19 @@ SMTP_EMAIL        = os.getenv('SMTP_EMAIL')
 SMTP_PASSWORD     = os.getenv('SMTP_PASSWORD')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 
+# ─── GENIUS PAY ───────────────────────────────────────────────────────────────
+GENIUS_PAY_API_KEY = os.getenv(
+    'GENIUS_PAY_API_KEY',
+    'sk_sandbox_700db46225aa9fa3921cae01b1b3cd5e80078756dac1216cc63bedf721eb81d9'
+)
+GENIUS_PAY_URL = 'https://pay.genius.ci/api/v1/merchant'
+FRONTEND_URL   = os.getenv('FRONTEND_URL', 'http://localhost:4200')
+
+GENIUS_PLANS = {
+    'premium':    {'label': 'MailNotifier - Plan Premium',    'amount': 5000,  'eur': 7.62},
+    'enterprise': {'label': 'MailNotifier - Plan Enterprise', 'amount': 15000, 'eur': 22.87},
+}
+
 notifier_status = {"running": False}
 
 
@@ -167,6 +180,7 @@ def init_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS genius_tx_id VARCHAR(200)")
         db.commit()
         print("Tables verifiees/creees avec succes.")
     finally:
@@ -529,6 +543,104 @@ def admin_delete_payment(pay_id):
         return jsonify({'message': 'Paiement supprime'}), 200
     finally:
         db.close()
+
+
+# ─── GENIUS PAY ENDPOINTS ────────────────────────────────────────────────────
+
+@app.route('/api/payments/initiate', methods=['POST'])
+def initiate_payment():
+    data  = request.get_json() or {}
+    plan  = data.get('plan', '').strip()
+    email = data.get('email', '').strip().lower()
+
+    if plan not in GENIUS_PLANS:
+        return jsonify({'error': 'Plan invalide'}), 400
+    if not email:
+        return jsonify({'error': 'Email requis'}), 400
+
+    plan_info = GENIUS_PLANS[plan]
+    payload = {
+        'amount':         plan_info['amount'],
+        'currency':       'XOF',
+        'description':    plan_info['label'],
+        'customer_email': email,
+        'return_url':     f"{FRONTEND_URL}/?payment_status=success&plan={plan}&email={email}",
+        'cancel_url':     f"{FRONTEND_URL}/?payment_status=cancel",
+        'metadata':       {'plan': plan, 'email': email},
+    }
+    headers = {
+        'Authorization': f"Bearer {GENIUS_PAY_API_KEY}",
+        'Content-Type':  'application/json',
+        'Accept':        'application/json',
+    }
+
+    try:
+        resp = requests.post(GENIUS_PAY_URL, json=payload, headers=headers, timeout=15)
+        body = resp.json() if resp.content else {}
+        if resp.ok:
+            payment_url = (body.get('payment_url') or body.get('url')
+                           or body.get('checkout_url') or body.get('link'))
+            tx_id = (body.get('id') or body.get('transaction_id')
+                     or body.get('reference') or body.get('tx_ref'))
+            if not payment_url:
+                return jsonify({'error': 'URL de paiement absente', 'raw': body}), 500
+            return jsonify({'payment_url': payment_url, 'tx_id': tx_id}), 200
+        else:
+            return jsonify({
+                'error': body.get('message', f'Genius Pay erreur {resp.status_code}'),
+                'raw': body
+            }), resp.status_code
+    except requests.Timeout:
+        return jsonify({'error': 'Genius Pay ne repond pas (timeout)'}), 504
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/payments/verify', methods=['POST'])
+def verify_payment():
+    data  = request.get_json() or {}
+    tx_id = data.get('tx_id', '').strip()
+    plan  = data.get('plan', '').strip()
+    email = data.get('email', '').strip().lower()
+
+    if not tx_id:
+        return jsonify({'error': 'tx_id requis'}), 400
+
+    headers = {
+        'Authorization': f"Bearer {GENIUS_PAY_API_KEY}",
+        'Accept':        'application/json',
+    }
+
+    try:
+        resp = requests.get(f"{GENIUS_PAY_URL}/{tx_id}", headers=headers, timeout=15)
+        body = resp.json() if resp.content else {}
+        status = (body.get('status') or '').lower()
+
+        if status in ('paid', 'success', 'completed', 'successful'):
+            if email and plan in GENIUS_PLANS:
+                db = get_db()
+                try:
+                    with db.cursor() as cur:
+                        cur.execute("SELECT id FROM users WHERE email=%s", (email,))
+                        user = cur.fetchone()
+                        if user:
+                            uid = user['id']
+                            cur.execute("UPDATE users SET plan=%s WHERE id=%s", (plan, uid))
+                            cur.execute(
+                                "INSERT INTO payments (user_id, plan, amount, status, genius_tx_id)"
+                                " VALUES (%s,%s,%s,'paid',%s)",
+                                (uid, plan, GENIUS_PLANS[plan]['eur'], tx_id)
+                            )
+                    db.commit()
+                finally:
+                    db.close()
+            return jsonify({'status': 'paid', 'plan': plan}), 200
+        else:
+            return jsonify({'status': status or 'unknown', 'raw': body}), 200
+    except requests.Timeout:
+        return jsonify({'error': 'Timeout verification'}), 504
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 # ─── GMAIL OAUTH2 WEB FLOW ────────────────────────────────────────────────────
