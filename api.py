@@ -59,10 +59,7 @@ SMTP_PASSWORD     = os.getenv('SMTP_PASSWORD')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 
 # ─── GENIUS PAY ───────────────────────────────────────────────────────────────
-GENIUS_PAY_API_KEY = os.getenv(
-    'GENIUS_PAY_API_KEY',
-    'sk_sandbox_700db46225aa9fa3921cae01b1b3cd5e80078756dac1216cc63bedf721eb81d9'
-)
+GENIUS_PAY_API_KEY = os.getenv('GENIUS_PAY_API_KEY', '')
 GENIUS_PAY_URL = 'https://pay.genius.ci/api/v1/merchant'
 FRONTEND_URL   = os.getenv('FRONTEND_URL', 'http://localhost:4200')
 
