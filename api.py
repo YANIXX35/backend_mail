@@ -64,6 +64,7 @@ GENIUS_PAY_URL = 'https://pay.genius.ci/api/v1/merchant'
 FRONTEND_URL   = os.getenv('FRONTEND_URL', 'http://localhost:4200')
 
 GENIUS_PLANS = {
+    'test':       {'label': 'MailNotifier - Test Paiement',   'amount': 50,    'eur': 0.08},
     'premium':    {'label': 'MailNotifier - Plan Premium',    'amount': 5000,  'eur': 7.62},
     'enterprise': {'label': 'MailNotifier - Plan Enterprise', 'amount': 15000, 'eur': 22.87},
 }
