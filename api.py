@@ -572,26 +572,75 @@ def initiate_payment():
         'Accept':        'application/json',
     }
 
+    print(f"[GeniusPay] Initiate → plan={plan} email={email} amount={plan_info['amount']} url={GENIUS_PAY_URL}")
     try:
         resp = requests.post(GENIUS_PAY_URL, json=payload, headers=headers, timeout=15)
-        body = resp.json() if resp.content else {}
+        print(f"[GeniusPay] Response status={resp.status_code} body={resp.text[:500]}")
+        try:
+            body = resp.json()
+        except Exception:
+            body = {'raw_text': resp.text}
         if resp.ok:
             payment_url = (body.get('payment_url') or body.get('url')
-                           or body.get('checkout_url') or body.get('link'))
+                           or body.get('checkout_url') or body.get('link')
+                           or body.get('data', {}).get('payment_url')
+                           or body.get('data', {}).get('url'))
             tx_id = (body.get('id') or body.get('transaction_id')
-                     or body.get('reference') or body.get('tx_ref'))
+                     or body.get('reference') or body.get('tx_ref')
+                     or body.get('data', {}).get('id')
+                     or body.get('data', {}).get('reference'))
             if not payment_url:
-                return jsonify({'error': 'URL de paiement absente', 'raw': body}), 500
+                return jsonify({'error': 'URL de paiement absente dans la reponse Genius Pay', 'raw': body}), 500
             return jsonify({'payment_url': payment_url, 'tx_id': tx_id}), 200
         else:
-            return jsonify({
-                'error': body.get('message', f'Genius Pay erreur {resp.status_code}'),
-                'raw': body
-            }), resp.status_code
+            msg = (body.get('message') or body.get('error') or body.get('detail')
+                   or f'Genius Pay erreur HTTP {resp.status_code}')
+            return jsonify({'error': msg, 'status_code': resp.status_code, 'raw': body}), 400
     except requests.Timeout:
-        return jsonify({'error': 'Genius Pay ne repond pas (timeout)'}), 504
+        return jsonify({'error': 'Genius Pay ne repond pas (timeout 15s)'}), 504
     except Exception as e:
+        print(f"[GeniusPay] Exception: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/payments/debug', methods=['GET'])
+def debug_payment():
+    """Endpoint de debug pour verifier la connexion Genius Pay."""
+    key_set = bool(GENIUS_PAY_API_KEY)
+    key_preview = GENIUS_PAY_API_KEY[:12] + '...' if key_set else 'NON DEFINI'
+    headers = {
+        'Authorization': f"Bearer {GENIUS_PAY_API_KEY}",
+        'Content-Type':  'application/json',
+        'Accept':        'application/json',
+    }
+    payload = {
+        'amount': 50, 'currency': 'XOF',
+        'description': 'Test debug',
+        'customer_email': 'test@test.com',
+        'return_url': f"{FRONTEND_URL}/",
+        'cancel_url':  f"{FRONTEND_URL}/",
+    }
+    try:
+        resp = requests.post(GENIUS_PAY_URL, json=payload, headers=headers, timeout=10)
+        try:
+            body = resp.json()
+        except Exception:
+            body = {'raw': resp.text}
+        return jsonify({
+            'api_key_set': key_set,
+            'api_key_preview': key_preview,
+            'genius_pay_url': GENIUS_PAY_URL,
+            'frontend_url': FRONTEND_URL,
+            'http_status': resp.status_code,
+            'response': body,
+        }), 200
+    except Exception as e:
+        return jsonify({
+            'api_key_set': key_set,
+            'api_key_preview': key_preview,
+            'genius_pay_url': GENIUS_PAY_URL,
+            'error': str(e),
+        }), 500
 
 
 @app.route('/api/payments/verify', methods=['POST'])
