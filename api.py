@@ -814,6 +814,26 @@ def gmail_status():
         db.close()
 
 
+@app.route('/api/auth/gmail-test', methods=['POST'])
+def test_gmail_imap():
+    """Teste la connexion IMAP Gmail avec un mot de passe d'application."""
+    data   = request.get_json() or {}
+    gmail  = data.get('gmail_address', '').strip().lower()
+    passwd = data.get('app_password', '').replace(' ', '').strip()
+    if not gmail or not passwd:
+        return jsonify({'success': False, 'error': 'Adresse Gmail et mot de passe requis'}), 400
+    try:
+        import imaplib
+        mail = imaplib.IMAP4_SSL('imap.gmail.com', 993)
+        mail.login(gmail, passwd)
+        mail.logout()
+        return jsonify({'success': True})
+    except imaplib.IMAP4.error as e:
+        return jsonify({'success': False, 'error': 'Code incorrect ou IMAP desactive'}), 401
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/webhooks/emailengine', methods=['POST'])
 def emailengine_webhook():
     """Recoit les evenements EmailEngine (nouveau mail) et envoie la notification Telegram."""
@@ -1112,7 +1132,7 @@ def _send_telegram_notification(chat_id, sender, subject, snippet, user_email):
 def _check_user_emails_imap(user):
     """Vérifie les nouveaux mails d'un utilisateur via IMAP + App Password."""
     gmail    = (user.get('gmail_address') or '').strip()
-    passwd   = (user.get('app_password') or '').strip()
+    passwd   = (user.get('app_password') or '').replace(' ', '').strip()
     chat_id  = user.get('telegram_chat_id')
     user_id  = user['id']
     last_uid = user.get('last_history_id')  # Re-used field to store last seen IMAP UID
