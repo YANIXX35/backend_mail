@@ -179,6 +179,7 @@ def init_db():
                 )
             """)
             cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS genius_tx_id VARCHAR(200)")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS app_password VARCHAR(200)")
         db.commit()
         print("Tables verifiees/creees avec succes.")
     finally:
@@ -753,13 +754,36 @@ def gmail_status():
     db = get_db()
     try:
         with db.cursor() as cur:
-            cur.execute("SELECT id, gmail_token FROM users WHERE email = %s", (email,))
+            cur.execute("SELECT app_password FROM users WHERE email = %s", (email,))
             user = cur.fetchone()
         if not user:
             return jsonify({'connected': False})
-        return jsonify({'connected': bool(user.get('gmail_token'))})
+        return jsonify({'connected': bool(user.get('app_password'))})
     finally:
         db.close()
+
+
+@app.route('/api/auth/gmail-test', methods=['POST'])
+def test_gmail_imap():
+    """Teste la connexion IMAP avec l'adresse Gmail et l'App Password."""
+    import imaplib
+    data   = request.get_json() or {}
+    gmail  = data.get('gmail_address', '').strip().lower()
+    passwd = data.get('app_password', '').strip()
+    if not gmail or not passwd:
+        return jsonify({'success': False, 'error': 'Gmail et app_password requis'}), 400
+    try:
+        mail = imaplib.IMAP4_SSL('imap.gmail.com', 993)
+        mail.login(gmail, passwd)
+        mail.select('INBOX', readonly=True)
+        _, data_r = mail.uid('search', None, 'ALL')
+        count = len(data_r[0].split()) if data_r[0] else 0
+        mail.logout()
+        return jsonify({'success': True, 'message': f'Connexion IMAP OK — {count} emails dans la boite'}), 200
+    except imaplib.IMAP4.error as e:
+        return jsonify({'success': False, 'error': f'Identifiants incorrects: {str(e)}'}), 401
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 # ─── GMAIL ROUTES ─────────────────────────────────────────────────────────────
@@ -882,22 +906,23 @@ def get_user_settings():
     try:
         with db.cursor() as cur:
             cur.execute(
-                "SELECT name, email, phone, gmail_address, telegram_chat_id, green_api_instance, green_api_token "
+                "SELECT name, email, phone, gmail_address, telegram_chat_id, green_api_instance, green_api_token, app_password "
                 "FROM users WHERE email = %s AND is_verified = 1",
                 (email,)
             )
             user = cur.fetchone()
         if not user:
-            # Retourne un objet vide plutôt qu'une 404 — l'utilisateur n'a pas encore rempli ses paramètres
             return jsonify({
                 "name": "", "email": email, "phone": "",
                 "gmail_address": "", "telegram_chat_id": "",
-                "green_api_instance": "", "green_api_token": ""
+                "green_api_instance": "", "green_api_token": "",
+                "app_password_set": False
             })
-        # Remplace les None par des chaînes vides pour le frontend
+        user = dict(user)
         for key in ["phone", "gmail_address", "telegram_chat_id", "green_api_instance", "green_api_token"]:
             if user.get(key) is None:
                 user[key] = ""
+        user['app_password_set'] = bool(user.pop('app_password', None))
         return jsonify(user)
     finally:
         db.close()
@@ -912,23 +937,45 @@ def update_user_settings():
     db = get_db()
     try:
         with db.cursor() as cur:
-            cur.execute(
-                """UPDATE users SET
-                    phone = %s,
-                    gmail_address = %s,
-                    telegram_chat_id = %s,
-                    green_api_instance = %s,
-                    green_api_token = %s
-                WHERE email = %s AND is_verified = 1""",
-                (
-                    data.get('phone'),
-                    data.get('gmail_address'),
-                    data.get('telegram_chat_id'),
-                    data.get('green_api_instance'),
-                    data.get('green_api_token'),
-                    email,
+            app_password = data.get('app_password', '').strip() or None
+            if app_password:
+                cur.execute(
+                    """UPDATE users SET
+                        phone = %s,
+                        gmail_address = %s,
+                        telegram_chat_id = %s,
+                        green_api_instance = %s,
+                        green_api_token = %s,
+                        app_password = %s
+                    WHERE email = %s AND is_verified = 1""",
+                    (
+                        data.get('phone'),
+                        data.get('gmail_address'),
+                        data.get('telegram_chat_id'),
+                        data.get('green_api_instance'),
+                        data.get('green_api_token'),
+                        app_password,
+                        email,
+                    )
                 )
-            )
+            else:
+                cur.execute(
+                    """UPDATE users SET
+                        phone = %s,
+                        gmail_address = %s,
+                        telegram_chat_id = %s,
+                        green_api_instance = %s,
+                        green_api_token = %s
+                    WHERE email = %s AND is_verified = 1""",
+                    (
+                        data.get('phone'),
+                        data.get('gmail_address'),
+                        data.get('telegram_chat_id'),
+                        data.get('green_api_instance'),
+                        data.get('green_api_token'),
+                        email,
+                    )
+                )
         db.commit()
         return jsonify({"success": True})
     except Exception as e:
@@ -937,18 +984,35 @@ def update_user_settings():
         db.close()
 
 
-# ─── EMAIL MONITOR ────────────────────────────────────────────────────────────
+# ─── EMAIL MONITOR (IMAP) ─────────────────────────────────────────────────────
 
 import re as _re
+import imaplib
+import email as _email_lib
+from email.header import decode_header as _decode_header
 
-def _save_history_id(user_id, history_id):
+def _save_last_uid(user_id, uid):
     db = get_db()
     try:
         with db.cursor() as cur:
-            cur.execute("UPDATE users SET last_history_id=%s WHERE id=%s", (history_id, user_id))
+            cur.execute("UPDATE users SET last_history_id=%s WHERE id=%s", (str(uid), user_id))
         db.commit()
     finally:
         db.close()
+
+
+def _decode_mime_header(value):
+    """Decode a MIME-encoded email header value to a plain string."""
+    if not value:
+        return ''
+    parts = _decode_header(value)
+    decoded = []
+    for part, enc in parts:
+        if isinstance(part, bytes):
+            decoded.append(part.decode(enc or 'utf-8', errors='replace'))
+        else:
+            decoded.append(part)
+    return ''.join(decoded)
 
 
 def _send_telegram_notification(chat_id, sender, subject, snippet, user_email):
@@ -978,81 +1042,81 @@ def _send_telegram_notification(chat_id, sender, subject, snippet, user_email):
         print(f"[Monitor] Telegram exception: {e}")
 
 
-def _check_user_emails(user):
-    """Vérifie les nouveaux mails d'un utilisateur via Gmail History API."""
-    service = get_gmail_service_for(user['email'])
-    if not service:
-        return
+def _check_user_emails_imap(user):
+    """Vérifie les nouveaux mails d'un utilisateur via IMAP + App Password."""
+    gmail    = (user.get('gmail_address') or '').strip()
+    passwd   = (user.get('app_password') or '').strip()
+    chat_id  = user.get('telegram_chat_id')
+    user_id  = user['id']
+    last_uid = user.get('last_history_id')  # Re-used field to store last seen IMAP UID
 
-    user_id       = user['id']
-    chat_id       = user['telegram_chat_id']
-    last_hist_id  = user.get('last_history_id')
-
-    if not last_hist_id:
-        # Premier passage : on enregistre le historyId courant sans notifier
-        try:
-            profile = service.users().getProfile(userId='me').execute()
-            _save_history_id(user_id, str(profile.get('historyId', '')))
-            print(f"[Monitor] Init historyId pour {user['email']}")
-        except Exception as e:
-            print(f"[Monitor] Erreur init historyId {user['email']}: {e}")
+    if not gmail or not passwd:
         return
 
     try:
-        history_result = service.users().history().list(
-            userId='me',
-            startHistoryId=last_hist_id,
-            historyTypes=['messageAdded'],
-            labelId='INBOX'
-        ).execute()
-    except Exception as e:
-        err_str = str(e)
-        print(f"[Monitor] History API erreur pour {user['email']}: {err_str}")
-        # historyId expiré → réinitialiser
-        if '404' in err_str or 'invalid' in err_str.lower():
+        mail = imaplib.IMAP4_SSL('imap.gmail.com', 993)
+        mail.login(gmail, passwd)
+        mail.select('INBOX', readonly=True)
+
+        _, data = mail.uid('search', None, 'ALL')
+        all_uids = data[0].split() if data[0] else []
+
+        if not all_uids:
+            mail.logout()
+            return
+
+        latest_uid = all_uids[-1].decode()
+
+        if not last_uid:
+            # First run: record latest UID, don't notify
+            _save_last_uid(user_id, latest_uid)
+            print(f"[Monitor] Init IMAP UID={latest_uid} pour {gmail}")
+            mail.logout()
+            return
+
+        # Fetch messages newer than last known UID
+        _, new_data = mail.uid('search', None, f'UID {int(last_uid)+1}:*')
+        new_uids = new_data[0].split() if new_data[0] else []
+
+        for uid_bytes in new_uids:
+            uid = uid_bytes.decode()
+            if int(uid) <= int(last_uid):
+                continue
             try:
-                profile = service.users().getProfile(userId='me').execute()
-                _save_history_id(user_id, str(profile.get('historyId', '')))
-                print(f"[Monitor] historyId reinitialise pour {user['email']}")
-            except Exception:
-                pass
-        return
+                _, msg_data = mail.uid('fetch', uid, '(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])')
+                if not msg_data or not msg_data[0]:
+                    continue
+                raw = msg_data[0][1] if isinstance(msg_data[0], tuple) else b''
+                msg = _email_lib.message_from_bytes(raw)
+                subject = _decode_mime_header(msg.get('Subject', '(Sans objet)'))
+                sender  = _decode_mime_header(msg.get('From', 'Inconnu'))
+                snippet = subject[:100]
+                if chat_id:
+                    _send_telegram_notification(chat_id, sender, subject, snippet, gmail)
+            except Exception as e:
+                print(f"[Monitor] Erreur lecture UID {uid}: {e}")
 
-    new_hist_id = str(history_result.get('historyId', last_hist_id))
-    history     = history_result.get('history', [])
+        _save_last_uid(user_id, latest_uid)
+        mail.logout()
 
-    for record in history:
-        for msg_added in record.get('messagesAdded', []):
-            msg    = msg_added.get('message', {})
-            labels = msg.get('labelIds', [])
-            if 'INBOX' in labels and 'UNREAD' in labels:
-                msg_id = msg['id']
-                try:
-                    msg_data = service.users().messages().get(
-                        userId='me', id=msg_id,
-                        format='metadata',
-                        metadataHeaders=['Subject', 'From']
-                    ).execute()
-                    headers  = msg_data['payload']['headers']
-                    subject  = next((h['value'] for h in headers if h['name'] == 'Subject'), '(Sans objet)')
-                    sender   = next((h['value'] for h in headers if h['name'] == 'From'), 'Inconnu')
-                    snippet  = msg_data.get('snippet', '')[:200]
-                    _send_telegram_notification(chat_id, sender, subject, snippet, user['email'])
-                except Exception as e:
-                    print(f"[Monitor] Erreur lecture msg {msg_id}: {e}")
-
-    _save_history_id(user_id, new_hist_id)
+    except imaplib.IMAP4.error as e:
+        print(f"[Monitor] IMAP erreur pour {gmail}: {e}")
+    except Exception as e:
+        print(f"[Monitor] Erreur inattendue pour {gmail}: {e}")
 
 
 def _check_all_users():
-    """Récupère tous les utilisateurs surveillables et vérifie leurs mails."""
+    """Récupère tous les utilisateurs surveillables et vérifie leurs mails via IMAP."""
     db = get_db()
     try:
         with db.cursor() as cur:
             cur.execute("""
-                SELECT id, email, telegram_chat_id, last_history_id
+                SELECT id, email, gmail_address, app_password, telegram_chat_id, last_history_id
                 FROM users
-                WHERE gmail_token IS NOT NULL
+                WHERE app_password IS NOT NULL
+                  AND app_password != ''
+                  AND gmail_address IS NOT NULL
+                  AND gmail_address != ''
                   AND telegram_chat_id IS NOT NULL
                   AND telegram_chat_id != ''
                   AND is_verified = 1
@@ -1064,10 +1128,10 @@ def _check_all_users():
     if not users:
         return
 
-    print(f"[Monitor] Verification de {len(users)} utilisateur(s)...")
+    print(f"[Monitor] Verification IMAP de {len(users)} utilisateur(s)...")
     for user in users:
         try:
-            _check_user_emails(user)
+            _check_user_emails_imap(user)
         except Exception as e:
             print(f"[Monitor] Erreur user {user['email']}: {e}")
 
