@@ -603,7 +603,7 @@ def initiate_payment():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/api/payments/debug', methods=['GET'])
+@app.route('/api/payments/debug', methods=['GET', 'POST'])
 def debug_payment():
     """Endpoint de debug pour verifier la connexion Genius Pay."""
     key_set = bool(GENIUS_PAY_API_KEY)
