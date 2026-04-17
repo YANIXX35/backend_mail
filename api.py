@@ -3,6 +3,8 @@ import os
 import time
 import random
 import smtplib
+import imaplib
+import email as _email_lib
 import requests
 import hashlib
 import threading
@@ -10,16 +12,13 @@ import json as _json
 from ssl import create_default_context
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.header import decode_header as _decode_header
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, redirect
 from flask_cors import CORS
 from dotenv import load_dotenv
 import psycopg2
 import psycopg2.extras
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-from google_auth_oauthlib.flow import Flow
-from googleapiclient.discovery import build
 
 load_dotenv()
 
@@ -37,44 +36,9 @@ def add_cors_headers(response):
 def handle_options(path):
     return '', 200
 
-SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
-CREDENTIALS_FILE = 'client_secret_566087061726-dvbm61gi2hkinu2eapo26iikrpr5johp.apps.googleusercontent.com.json'
-
-oauth_pending = {}  # state -> {email, user_id, flow}
-
-
-def get_credentials_path():
-    """Charge le client secret depuis GOOGLE_CLIENT_SECRET_JSON (Render/prod)
-    ou depuis le fichier local (dev)."""
-    secret_env = os.getenv('GOOGLE_CLIENT_SECRET_JSON')
-    if secret_env:
-        path = '/tmp/client_secret.json'
-        with open(path, 'w') as f:
-            f.write(secret_env)
-        return path
-    return CREDENTIALS_FILE
-
-SMTP_EMAIL         = os.getenv('SMTP_EMAIL')
-SMTP_PASSWORD      = os.getenv('SMTP_PASSWORD')
+SMTP_EMAIL        = os.getenv('SMTP_EMAIL')
+SMTP_PASSWORD     = os.getenv('SMTP_PASSWORD')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-
-# ─── EMAILENGINE ──────────────────────────────────────────────────────────────
-EE_URL   = os.getenv('EMAILENGINE_URL', '').rstrip('/')   # ex: https://emailengine.onrender.com
-EE_TOKEN = os.getenv('EMAILENGINE_TOKEN', '')             # Access token genere dans l'UI EmailEngine
-
-def _ee_headers():
-    return {'Authorization': f'Bearer {EE_TOKEN}', 'Content-Type': 'application/json'}
-
-# ─── GENIUS PAY ───────────────────────────────────────────────────────────────
-GENIUS_PAY_API_KEY = os.getenv('GENIUS_PAY_API_KEY', '')
-GENIUS_PAY_URL = 'https://pay.genius.ci/api/v1/merchant'
-FRONTEND_URL   = os.getenv('FRONTEND_URL', 'http://localhost:4200')
-
-GENIUS_PLANS = {
-    'test':       {'label': 'MailNotifier - Test Paiement',   'amount': 50,    'eur': 0.08},
-    'premium':    {'label': 'MailNotifier - Plan Premium',    'amount': 5000,  'eur': 7.62},
-    'enterprise': {'label': 'MailNotifier - Plan Enterprise', 'amount': 15000, 'eur': 22.87},
-}
 
 notifier_status = {"running": False}
 
@@ -161,6 +125,7 @@ def init_db():
             """)
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_token TEXT")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_history_id VARCHAR(50)")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS app_password VARCHAR(200)")
             # Promouvoir l'admin principal
             cur.execute("UPDATE users SET role='admin' WHERE email='kyliyanisse@gmail.com'")
             cur.execute("""
@@ -185,34 +150,12 @@ def init_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS genius_tx_id VARCHAR(200)")
-            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS app_password VARCHAR(200)")
         db.commit()
         print("Tables verifiees/creees avec succes.")
     finally:
         db.close()
 
 
-# ─── TOKEN HELPERS (DB) ───────────────────────────────────────────────────────
-
-def save_token_to_db(user_id, credentials_json):
-    db = get_db()
-    try:
-        with db.cursor() as cur:
-            cur.execute("UPDATE users SET gmail_token=%s WHERE id=%s", (credentials_json, user_id))
-        db.commit()
-    finally:
-        db.close()
-
-def load_token_from_db(user_id):
-    db = get_db()
-    try:
-        with db.cursor() as cur:
-            cur.execute("SELECT gmail_token FROM users WHERE id=%s", (user_id,))
-            row = cur.fetchone()
-        return row['gmail_token'] if row and row.get('gmail_token') else None
-    finally:
-        db.close()
 
 
 # ─── UTILS ────────────────────────────────────────────────────────────────────
@@ -430,7 +373,7 @@ def admin_get_users():
             cur.execute("""
                 SELECT id, name, email, is_verified, role, plan, phone,
                        gmail_address, telegram_chat_id, green_api_instance,
-                       CASE WHEN gmail_token IS NOT NULL THEN TRUE ELSE FALSE END as gmail_connected,
+                       CASE WHEN app_password IS NOT NULL THEN TRUE ELSE FALSE END as gmail_connected,
                        CASE WHEN last_history_id IS NOT NULL THEN TRUE ELSE FALSE END as monitor_active,
                        created_at
                 FROM users ORDER BY created_at DESC
@@ -551,268 +494,7 @@ def admin_delete_payment(pay_id):
         db.close()
 
 
-# ─── GENIUS PAY ENDPOINTS ────────────────────────────────────────────────────
-
-@app.route('/api/payments/initiate', methods=['POST'])
-def initiate_payment():
-    data  = request.get_json() or {}
-    plan  = data.get('plan', '').strip()
-    email = data.get('email', '').strip().lower()
-
-    if plan not in GENIUS_PLANS:
-        return jsonify({'error': 'Plan invalide'}), 400
-    if not email:
-        return jsonify({'error': 'Email requis'}), 400
-
-    plan_info = GENIUS_PLANS[plan]
-    payload = {
-        'amount':         plan_info['amount'],
-        'currency':       'XOF',
-        'description':    plan_info['label'],
-        'customer_email': email,
-        'return_url':     f"{FRONTEND_URL}/?payment_status=success&plan={plan}&email={email}",
-        'cancel_url':     f"{FRONTEND_URL}/?payment_status=cancel",
-        'metadata':       {'plan': plan, 'email': email},
-    }
-    headers = {
-        'Authorization': f"Bearer {GENIUS_PAY_API_KEY}",
-        'Content-Type':  'application/json',
-        'Accept':        'application/json',
-    }
-
-    print(f"[GeniusPay] Initiate → plan={plan} email={email} amount={plan_info['amount']} url={GENIUS_PAY_URL}")
-    try:
-        resp = requests.post(GENIUS_PAY_URL, json=payload, headers=headers, timeout=15)
-        print(f"[GeniusPay] Response status={resp.status_code} body={resp.text[:500]}")
-        try:
-            body = resp.json()
-        except Exception:
-            body = {'raw_text': resp.text}
-        if resp.ok:
-            payment_url = (body.get('payment_url') or body.get('url')
-                           or body.get('checkout_url') or body.get('link')
-                           or body.get('data', {}).get('payment_url')
-                           or body.get('data', {}).get('url'))
-            tx_id = (body.get('id') or body.get('transaction_id')
-                     or body.get('reference') or body.get('tx_ref')
-                     or body.get('data', {}).get('id')
-                     or body.get('data', {}).get('reference'))
-            if not payment_url:
-                return jsonify({'error': 'URL de paiement absente dans la reponse Genius Pay', 'raw': body}), 500
-            return jsonify({'payment_url': payment_url, 'tx_id': tx_id}), 200
-        else:
-            msg = (body.get('message') or body.get('error') or body.get('detail')
-                   or f'Genius Pay erreur HTTP {resp.status_code}')
-            return jsonify({'error': msg, 'status_code': resp.status_code, 'raw': body}), 400
-    except requests.Timeout:
-        return jsonify({'error': 'Genius Pay ne repond pas (timeout 15s)'}), 504
-    except Exception as e:
-        print(f"[GeniusPay] Exception: {e}")
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/payments/debug', methods=['GET', 'POST'])
-def debug_payment():
-    """Endpoint de debug pour verifier la connexion Genius Pay."""
-    key_set = bool(GENIUS_PAY_API_KEY)
-    key_preview = GENIUS_PAY_API_KEY[:12] + '...' if key_set else 'NON DEFINI'
-    headers = {
-        'Authorization': f"Bearer {GENIUS_PAY_API_KEY}",
-        'Content-Type':  'application/json',
-        'Accept':        'application/json',
-    }
-    payload = {
-        'amount': 50, 'currency': 'XOF',
-        'description': 'Test debug',
-        'customer_email': 'test@test.com',
-        'return_url': f"{FRONTEND_URL}/",
-        'cancel_url':  f"{FRONTEND_URL}/",
-    }
-    try:
-        resp = requests.post(GENIUS_PAY_URL, json=payload, headers=headers, timeout=10)
-        try:
-            body = resp.json()
-        except Exception:
-            body = {'raw': resp.text}
-        return jsonify({
-            'api_key_set': key_set,
-            'api_key_preview': key_preview,
-            'genius_pay_url': GENIUS_PAY_URL,
-            'frontend_url': FRONTEND_URL,
-            'http_status': resp.status_code,
-            'response': body,
-        }), 200
-    except Exception as e:
-        return jsonify({
-            'api_key_set': key_set,
-            'api_key_preview': key_preview,
-            'genius_pay_url': GENIUS_PAY_URL,
-            'error': str(e),
-        }), 500
-
-
-@app.route('/api/payments/verify', methods=['POST'])
-def verify_payment():
-    data  = request.get_json() or {}
-    tx_id = data.get('tx_id', '').strip()
-    plan  = data.get('plan', '').strip()
-    email = data.get('email', '').strip().lower()
-
-    if not tx_id:
-        return jsonify({'error': 'tx_id requis'}), 400
-
-    headers = {
-        'Authorization': f"Bearer {GENIUS_PAY_API_KEY}",
-        'Accept':        'application/json',
-    }
-
-    try:
-        resp = requests.get(f"{GENIUS_PAY_URL}/{tx_id}", headers=headers, timeout=15)
-        body = resp.json() if resp.content else {}
-        status = (body.get('status') or '').lower()
-
-        if status in ('paid', 'success', 'completed', 'successful'):
-            if email and plan in GENIUS_PLANS:
-                db = get_db()
-                try:
-                    with db.cursor() as cur:
-                        cur.execute("SELECT id FROM users WHERE email=%s", (email,))
-                        user = cur.fetchone()
-                        if user:
-                            uid = user['id']
-                            cur.execute("UPDATE users SET plan=%s WHERE id=%s", (plan, uid))
-                            cur.execute(
-                                "INSERT INTO payments (user_id, plan, amount, status, genius_tx_id)"
-                                " VALUES (%s,%s,%s,'paid',%s)",
-                                (uid, plan, GENIUS_PLANS[plan]['eur'], tx_id)
-                            )
-                    db.commit()
-                finally:
-                    db.close()
-            return jsonify({'status': 'paid', 'plan': plan}), 200
-        else:
-            return jsonify({'status': status or 'unknown', 'raw': body}), 200
-    except requests.Timeout:
-        return jsonify({'error': 'Timeout verification'}), 504
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-# ─── GMAIL OAUTH2 WEB FLOW ────────────────────────────────────────────────────
-
-@app.route('/api/auth/gmail-connect')
-def gmail_connect():
-    email = request.args.get('email', '').strip().lower()
-    if not email:
-        return jsonify({'error': 'email requis'}), 400
-    db = get_db()
-    try:
-        with db.cursor() as cur:
-            cur.execute("SELECT id FROM users WHERE email = %s AND is_verified = 1", (email,))
-            user = cur.fetchone()
-        if not user:
-            return jsonify({'error': 'Utilisateur non trouve'}), 404
-    finally:
-        db.close()
-
-    os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
-    base_url     = os.getenv('APP_BASE_URL', 'http://localhost:5000').rstrip('/')
-    redirect_uri = f'{base_url}/api/auth/gmail-callback'
-
-    flow = Flow.from_client_secrets_file(
-        get_credentials_path(), SCOPES, redirect_uri=redirect_uri
-    )
-    auth_url, state = flow.authorization_url(access_type='offline', prompt='consent')
-    oauth_pending[state] = {'email': email, 'user_id': user['id'], 'flow': flow}
-    return jsonify({'auth_url': auth_url})
-
-
-@app.route('/api/auth/gmail-callback')
-def gmail_callback():
-    state        = request.args.get('state')
-    error        = request.args.get('error')
-    frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:4200').rstrip('/')
-
-    if error:
-        return redirect(f'{frontend_url}/dashboard?gmail=error&msg={error}')
-    if not state or state not in oauth_pending:
-        return redirect(f'{frontend_url}/dashboard?gmail=error&msg=session_invalid')
-
-    pending = oauth_pending.pop(state)
-    flow    = pending['flow']
-    try:
-        base_url          = os.getenv('APP_BASE_URL', 'http://localhost:5000').rstrip('/')
-        flow.redirect_uri = f'{base_url}/api/auth/gmail-callback'
-        flow.fetch_token(code=request.args.get('code'))
-        save_token_to_db(pending['user_id'], flow.credentials.to_json())
-        print(f"[OAuth2] Token sauvegarde en DB pour user_id={pending['user_id']}")
-    except Exception as e:
-        print(f"[OAuth2] Erreur: {e}")
-        return redirect(f'{frontend_url}/dashboard?gmail=error&msg=token_failed')
-
-    return redirect(f'{frontend_url}/dashboard?gmail=connected')
-
-
-@app.route('/api/auth/gmail-connect')
-def gmail_connect():
-    """Retourne l'URL OAuth2 EmailEngine pour connecter le Gmail de l'utilisateur."""
-    email = request.args.get('email', '').strip().lower()
-    if not email:
-        return jsonify({'error': 'email requis'}), 400
-    if not EE_URL or not EE_TOKEN:
-        return jsonify({'error': 'EmailEngine non configure (EMAILENGINE_URL / EMAILENGINE_TOKEN manquants)'}), 503
-
-    frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:4200').rstrip('/')
-    redirect_url = f"{frontend_url}/dashboard?gmail=connected"
-
-    try:
-        # Cree le compte dans EmailEngine s'il n'existe pas encore
-        requests.post(
-            f"{EE_URL}/v1/account",
-            json={"account": email, "name": email, "email": email},
-            headers=_ee_headers(), timeout=10
-        )
-        # Recupere l'URL du formulaire d'authentification OAuth2
-        resp = requests.post(
-            f"{EE_URL}/v1/authentication/form",
-            json={"account": email, "type": "oauth2", "redirectUrl": redirect_url},
-            headers=_ee_headers(), timeout=10
-        )
-        body = resp.json()
-        auth_url = body.get('url') or body.get('authUrl') or body.get('redirect')
-        if not auth_url:
-            return jsonify({'error': f'URL OAuth2 absente dans la reponse EmailEngine: {body}'}), 500
-        return jsonify({'auth_url': auth_url})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/auth/gmail-status')
-def gmail_status():
-    email = request.args.get('email', '').strip().lower()
-    if not email:
-        return jsonify({'connected': False}), 400
-
-    if EE_URL and EE_TOKEN:
-        try:
-            resp = requests.get(f"{EE_URL}/v1/account/{email}", headers=_ee_headers(), timeout=10)
-            if resp.status_code == 200:
-                state = resp.json().get('state', '')
-                return jsonify({'connected': state in ('connected', 'syncing', 'ready', 'authenticated')})
-            return jsonify({'connected': False})
-        except Exception:
-            return jsonify({'connected': False})
-
-    # Fallback : verifier l'app_password en DB
-    db = get_db()
-    try:
-        with db.cursor() as cur:
-            cur.execute("SELECT app_password FROM users WHERE email = %s", (email,))
-            user = cur.fetchone()
-        return jsonify({'connected': bool(user and user.get('app_password'))})
-    finally:
-        db.close()
-
+# ─── GMAIL IMAP ───────────────────────────────────────────────────────────────
 
 @app.route('/api/auth/gmail-test', methods=['POST'])
 def test_gmail_imap():
@@ -823,83 +505,29 @@ def test_gmail_imap():
     if not gmail or not passwd:
         return jsonify({'success': False, 'error': 'Adresse Gmail et mot de passe requis'}), 400
     try:
-        import imaplib
         mail = imaplib.IMAP4_SSL('imap.gmail.com', 993)
         mail.login(gmail, passwd)
         mail.logout()
         return jsonify({'success': True})
-    except imaplib.IMAP4.error as e:
+    except imaplib.IMAP4.error:
         return jsonify({'success': False, 'error': 'Code incorrect ou IMAP desactive'}), 401
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-@app.route('/api/webhooks/emailengine', methods=['POST'])
-def emailengine_webhook():
-    """Recoit les evenements EmailEngine (nouveau mail) et envoie la notification Telegram."""
-    data  = request.get_json() or {}
-    event = data.get('event')
-
-    if event != 'messageNew':
-        return jsonify({'ok': True})
-
-    account  = data.get('account', '')
-    msg      = data.get('data', {})
-    subject  = msg.get('subject', '(Sans objet)')
-    from_obj = msg.get('from', {})
-    if isinstance(from_obj, list):
-        from_obj = from_obj[0] if from_obj else {}
-    sender  = from_obj.get('name') or from_obj.get('address', 'Inconnu')
-    snippet = msg.get('snippet', msg.get('text', ''))[:200]
-
-    print(f"[Webhook] Nouveau mail pour {account} — sujet: {subject}")
-
+@app.route('/api/auth/gmail-status')
+def gmail_status():
+    email = request.args.get('email', '').strip().lower()
+    if not email:
+        return jsonify({'connected': False}), 400
     db = get_db()
     try:
         with db.cursor() as cur:
-            cur.execute("""
-                SELECT telegram_chat_id, email
-                FROM users
-                WHERE (gmail_address = %s OR email = %s) AND is_verified = 1
-                LIMIT 1
-            """, (account, account))
+            cur.execute("SELECT app_password FROM users WHERE email = %s", (email,))
             user = cur.fetchone()
+        return jsonify({'connected': bool(user and user.get('app_password'))})
     finally:
         db.close()
-
-    if user and user.get('telegram_chat_id'):
-        _send_telegram_notification(user['telegram_chat_id'], sender, subject, snippet, account)
-
-    return jsonify({'ok': True})
-
-
-# ─── GMAIL ROUTES ─────────────────────────────────────────────────────────────
-
-def get_gmail_service_for(email):
-    """Retourne le service Gmail pour un utilisateur donné via son token en DB."""
-    db = get_db()
-    try:
-        with db.cursor() as cur:
-            cur.execute("SELECT id FROM users WHERE email = %s", (email,))
-            user = cur.fetchone()
-        if not user:
-            return None
-        user_id = user['id']
-    finally:
-        db.close()
-
-    token_json = load_token_from_db(user_id)
-    if not token_json:
-        return None
-
-    creds = Credentials.from_authorized_user_info(_json.loads(token_json), SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            save_token_to_db(user_id, creds.to_json())
-        else:
-            return None
-    return build('gmail', 'v1', credentials=creds)
 
 
 @app.route('/api/status')
@@ -912,25 +540,70 @@ def get_status():
     })
 
 
+def _get_imap_conn(email_addr):
+    """Retourne une connexion IMAP4_SSL pour l'utilisateur ou None."""
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT app_password FROM users WHERE email = %s AND is_verified = 1", (email_addr,))
+            row = cur.fetchone()
+    finally:
+        db.close()
+    if not row or not row.get('app_password'):
+        return None
+    passwd = row['app_password'].replace(' ', '').strip()
+    try:
+        mail = imaplib.IMAP4_SSL('imap.gmail.com', 993)
+        mail.login(email_addr, passwd)
+        return mail
+    except Exception:
+        return None
+
+
+def _decode_mime_header(value):
+    parts = _decode_header(value or '')
+    result = []
+    for part, enc in parts:
+        if isinstance(part, bytes):
+            result.append(part.decode(enc or 'utf-8', errors='replace'))
+        else:
+            result.append(part)
+    return ''.join(result)
+
+
 @app.route('/api/emails')
 def get_emails():
     email = request.args.get('email', '').strip().lower()
+    if not email:
+        return jsonify([])
     try:
-        service = get_gmail_service_for(email) if email else None
-        if not service:
+        mail = _get_imap_conn(email)
+        if not mail:
             return jsonify([])
-        results = service.users().messages().list(userId='me', labelIds=['INBOX'], maxResults=20).execute()
-        messages = results.get('messages', [])
+        mail.select('INBOX', readonly=True)
+        _, data = mail.uid('search', None, 'ALL')
+        uids = data[0].split() if data[0] else []
+        uids = uids[-20:][::-1]
         emails = []
-        for msg in messages:
-            msg_data = service.users().messages().get(userId='me', id=msg['id'], format='full').execute()
-            headers  = msg_data['payload']['headers']
-            subject  = next((h['value'] for h in headers if h['name'] == 'Subject'), '(Sans objet)')
-            sender   = next((h['value'] for h in headers if h['name'] == 'From'), 'Inconnu')
-            date     = next((h['value'] for h in headers if h['name'] == 'Date'), '')
-            snippet  = msg_data.get('snippet', '')[:150]
-            is_unread = 'UNREAD' in msg_data.get('labelIds', [])
-            emails.append({"id": msg['id'], "subject": subject, "sender": sender, "date": date, "snippet": snippet, "unread": is_unread})
+        for uid in uids:
+            _, msg_data = mail.uid('fetch', uid, '(RFC822)')
+            raw = msg_data[0][1]
+            msg = _email_lib.message_from_bytes(raw)
+            subject = _decode_mime_header(msg.get('Subject', '(Sans objet)'))
+            sender  = _decode_mime_header(msg.get('From', 'Inconnu'))
+            date    = msg.get('Date', '')
+            body    = ''
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == 'text/plain':
+                        body = part.get_payload(decode=True).decode('utf-8', errors='replace')[:150]
+                        break
+            else:
+                body = msg.get_payload(decode=True).decode('utf-8', errors='replace')[:150]
+            _, flags_data = mail.uid('fetch', uid, '(FLAGS)')
+            is_unread = b'\\Seen' not in (flags_data[0] or b'')
+            emails.append({"id": uid.decode(), "subject": subject, "sender": sender, "date": date, "snippet": body, "unread": is_unread})
+        mail.logout()
         return jsonify(emails)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -939,17 +612,19 @@ def get_emails():
 @app.route('/api/stats')
 def get_stats():
     email = request.args.get('email', '').strip().lower()
+    if not email:
+        return jsonify({"total_messages": 0, "unread_count": 0, "email": email})
     try:
-        service = get_gmail_service_for(email) if email else None
-        if not service:
+        mail = _get_imap_conn(email)
+        if not mail:
             return jsonify({"total_messages": 0, "unread_count": 0, "email": email})
-        profile = service.users().getProfile(userId='me').execute()
-        unread  = service.users().messages().list(userId='me', labelIds=['INBOX', 'UNREAD'], maxResults=1).execute()
-        return jsonify({
-            "total_messages": profile.get('messagesTotal', 0),
-            "unread_count": unread.get('resultSizeEstimate', 0),
-            "email": profile.get('emailAddress', '')
-        })
+        mail.select('INBOX', readonly=True)
+        _, total_data  = mail.uid('search', None, 'ALL')
+        _, unread_data = mail.uid('search', None, 'UNSEEN')
+        total  = len(total_data[0].split()) if total_data[0] else 0
+        unread = len(unread_data[0].split()) if unread_data[0] else 0
+        mail.logout()
+        return jsonify({"total_messages": total, "unread_count": unread, "email": email})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1024,7 +699,7 @@ def update_user_settings():
     db = get_db()
     try:
         with db.cursor() as cur:
-            app_password = data.get('app_password', '').strip() or None
+            app_password = data.get('app_password', '').replace(' ', '').strip() or None
             if app_password:
                 cur.execute(
                     """UPDATE users SET
@@ -1071,35 +746,9 @@ def update_user_settings():
         db.close()
 
 
-# ─── EMAIL MONITOR (IMAP) ─────────────────────────────────────────────────────
+# ─── EMAIL MONITOR ────────────────────────────────────────────────────────────
 
 import re as _re
-import imaplib
-import email as _email_lib
-from email.header import decode_header as _decode_header
-
-def _save_last_uid(user_id, uid):
-    db = get_db()
-    try:
-        with db.cursor() as cur:
-            cur.execute("UPDATE users SET last_history_id=%s WHERE id=%s", (str(uid), user_id))
-        db.commit()
-    finally:
-        db.close()
-
-
-def _decode_mime_header(value):
-    """Decode a MIME-encoded email header value to a plain string."""
-    if not value:
-        return ''
-    parts = _decode_header(value)
-    decoded = []
-    for part, enc in parts:
-        if isinstance(part, bytes):
-            decoded.append(part.decode(enc or 'utf-8', errors='replace'))
-        else:
-            decoded.append(part)
-    return ''.join(decoded)
 
 
 def _send_telegram_notification(chat_id, sender, subject, snippet, user_email):
@@ -1129,13 +778,23 @@ def _send_telegram_notification(chat_id, sender, subject, snippet, user_email):
         print(f"[Monitor] Telegram exception: {e}")
 
 
+def _save_last_uid(user_id, uid):
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("UPDATE users SET last_history_id=%s WHERE id=%s", (str(uid), user_id))
+        db.commit()
+    finally:
+        db.close()
+
+
 def _check_user_emails_imap(user):
     """Vérifie les nouveaux mails d'un utilisateur via IMAP + App Password."""
-    gmail    = (user.get('gmail_address') or '').strip()
-    passwd   = (user.get('app_password') or '').replace(' ', '').strip()
-    chat_id  = user.get('telegram_chat_id')
-    user_id  = user['id']
-    last_uid = user.get('last_history_id')  # Re-used field to store last seen IMAP UID
+    gmail   = (user.get('gmail_address') or '').strip()
+    passwd  = (user.get('app_password') or '').replace(' ', '').strip()
+    chat_id = user.get('telegram_chat_id')
+    user_id = user['id']
+    last_uid = user.get('last_history_id')
 
     if not gmail or not passwd:
         return
@@ -1147,43 +806,45 @@ def _check_user_emails_imap(user):
 
         _, data = mail.uid('search', None, 'ALL')
         all_uids = data[0].split() if data[0] else []
-
         if not all_uids:
             mail.logout()
             return
 
-        latest_uid = all_uids[-1].decode()
+        latest_uid = all_uids[-1]
 
         if not last_uid:
-            # First run: record latest UID, don't notify
-            _save_last_uid(user_id, latest_uid)
-            print(f"[Monitor] Init IMAP UID={latest_uid} pour {gmail}")
+            # Premier passage : on note le dernier UID sans notifier
+            _save_last_uid(user_id, latest_uid.decode())
+            print(f"[Monitor] Init last_uid={latest_uid.decode()} pour {gmail}")
             mail.logout()
             return
 
-        # Fetch messages newer than last known UID
+        # Cherche les UIDs plus récents que last_uid
         _, new_data = mail.uid('search', None, f'UID {int(last_uid)+1}:*')
         new_uids = new_data[0].split() if new_data[0] else []
+        new_uids = [u for u in new_uids if int(u) > int(last_uid)]
 
-        for uid_bytes in new_uids:
-            uid = uid_bytes.decode()
-            if int(uid) <= int(last_uid):
-                continue
+        for uid in new_uids:
             try:
-                _, msg_data = mail.uid('fetch', uid, '(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])')
-                if not msg_data or not msg_data[0]:
-                    continue
-                raw = msg_data[0][1] if isinstance(msg_data[0], tuple) else b''
+                _, msg_data = mail.uid('fetch', uid, '(RFC822)')
+                raw = msg_data[0][1]
                 msg = _email_lib.message_from_bytes(raw)
                 subject = _decode_mime_header(msg.get('Subject', '(Sans objet)'))
                 sender  = _decode_mime_header(msg.get('From', 'Inconnu'))
-                snippet = subject[:100]
+                body    = ''
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() == 'text/plain':
+                            body = part.get_payload(decode=True).decode('utf-8', errors='replace')[:200]
+                            break
+                else:
+                    body = msg.get_payload(decode=True).decode('utf-8', errors='replace')[:200]
                 if chat_id:
-                    _send_telegram_notification(chat_id, sender, subject, snippet, gmail)
+                    _send_telegram_notification(chat_id, sender, subject, body, gmail)
             except Exception as e:
                 print(f"[Monitor] Erreur lecture UID {uid}: {e}")
 
-        _save_last_uid(user_id, latest_uid)
+        _save_last_uid(user_id, latest_uid.decode())
         mail.logout()
 
     except imaplib.IMAP4.error as e:
@@ -1201,7 +862,6 @@ def _check_all_users():
                 SELECT id, email, gmail_address, app_password, telegram_chat_id, last_history_id
                 FROM users
                 WHERE app_password IS NOT NULL
-                  AND app_password != ''
                   AND gmail_address IS NOT NULL
                   AND gmail_address != ''
                   AND telegram_chat_id IS NOT NULL
@@ -1224,11 +884,8 @@ def _check_all_users():
 
 
 def monitor_emails_loop():
-    """Boucle de surveillance IMAP (fallback si EmailEngine non configure)."""
-    if EE_URL and EE_TOKEN:
-        print("[Monitor] EmailEngine actif — surveillance IMAP desactivee (webhooks utilises)")
-        return
-    print("[Monitor] Surveillance IMAP demarree (intervalle 30s) — mode fallback")
+    """Boucle principale : vérifie les nouveaux mails toutes les 30 secondes."""
+    print("[Monitor] Surveillance des emails demarree (intervalle 30s)")
     while True:
         try:
             _check_all_users()
@@ -1239,17 +896,17 @@ def monitor_emails_loop():
 
 # ─── DEBUG / TEST ENDPOINT ────────────────────────────────────────────────────
 
-@app.route('/api/monitor/test')
+@app.route('/api/monitor/test', methods=['GET', 'POST'])
 def monitor_test():
-    """Endpoint de debug : lance un cycle de check et retourne les détails."""
+    """Endpoint de debug : liste les utilisateurs et leur etat IMAP."""
     logs = []
 
     db = get_db()
     try:
         with db.cursor() as cur:
             cur.execute("""
-                SELECT id, email, telegram_chat_id, last_history_id,
-                       (gmail_token IS NOT NULL) as has_token
+                SELECT id, email, gmail_address, telegram_chat_id, last_history_id,
+                       (app_password IS NOT NULL) as has_password
                 FROM users WHERE is_verified = 1
             """)
             all_users = [dict(u) for u in cur.fetchall()]
@@ -1259,36 +916,19 @@ def monitor_test():
     logs.append(f"Total utilisateurs: {len(all_users)}")
     for u in all_users:
         logs.append(
-            f"  - {u['email']} | telegram={u['telegram_chat_id']} | "
-            f"gmail_token={'OUI' if u['has_token'] else 'NON'} | "
-            f"last_history_id={u['last_history_id']}"
+            f"  - {u['email']} | gmail={u['gmail_address']} | "
+            f"app_password={'OUI' if u['has_password'] else 'NON'} | "
+            f"telegram={u['telegram_chat_id']} | last_uid={u['last_history_id']}"
         )
 
-    # Utilisateurs éligibles pour la surveillance
-    eligible = [u for u in all_users if u['has_token'] and u['telegram_chat_id']]
-    logs.append(f"Eligibles (token + telegram): {len(eligible)}")
+    eligible = [u for u in all_users if u['has_password'] and u['telegram_chat_id']]
+    logs.append(f"Eligibles IMAP (app_password + telegram): {len(eligible)}")
 
     for user in eligible:
-        service = get_gmail_service_for(user['email'])
-        if not service:
-            logs.append(f"  ⚠ {user['email']}: service Gmail indisponible (token invalide ?)")
-            continue
-
-        if not user['last_history_id']:
-            try:
-                profile = service.users().getProfile(userId='me').execute()
-                hist_id = str(profile.get('historyId', ''))
-                _save_history_id(user['id'], hist_id)
-                logs.append(f"  ✓ {user['email']}: historyId initialisé à {hist_id}")
-            except Exception as e:
-                logs.append(f"  ✗ {user['email']}: erreur init historyId: {e}")
-            continue
-
-        # Teste l'envoi Telegram directement
         test_text = (
             f"\U0001f4e7 *Test MailNotifier*\n\n"
-            f"Le systeme de notification fonctionne correctement !\n"
-            f"_Compte surveille : {user['email']}_"
+            f"Le systeme de notification IMAP fonctionne !\n"
+            f"_Compte surveille : {user['gmail_address'] or user['email']}_"
         )
         try:
             resp = requests.post(
