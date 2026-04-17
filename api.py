@@ -127,6 +127,8 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_history_id VARCHAR(50)")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS app_password VARCHAR(200)")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS theme_color VARCHAR(20)")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS font_family VARCHAR(60)")
             # Promouvoir l'admin principal
             cur.execute("UPDATE users SET role='admin' WHERE email='kyliyanisse@gmail.com'")
             cur.execute("""
@@ -669,7 +671,8 @@ def get_user_settings():
     try:
         with db.cursor() as cur:
             cur.execute(
-                "SELECT name, email, phone, gmail_address, telegram_chat_id, green_api_instance, green_api_token, app_password, avatar "
+                "SELECT name, email, phone, gmail_address, telegram_chat_id, green_api_instance, "
+                "green_api_token, app_password, avatar, theme_color, font_family "
                 "FROM users WHERE email = %s AND is_verified = 1",
                 (email,)
             )
@@ -679,14 +682,14 @@ def get_user_settings():
                 "name": "", "email": email, "phone": "",
                 "gmail_address": "", "telegram_chat_id": "",
                 "green_api_instance": "", "green_api_token": "",
-                "app_password_set": False, "avatar": ""
+                "app_password_set": False, "avatar": "",
+                "theme_color": "", "font_family": ""
             })
         user = dict(user)
-        for key in ["phone", "gmail_address", "telegram_chat_id", "green_api_instance", "green_api_token"]:
+        for key in ["phone", "gmail_address", "telegram_chat_id", "green_api_instance",
+                    "green_api_token", "avatar", "theme_color", "font_family"]:
             if user.get(key) is None:
                 user[key] = ""
-        if user.get('avatar') is None:
-            user['avatar'] = ""
         user['app_password_set'] = bool(user.pop('app_password', None))
         return jsonify(user)
     finally:
@@ -703,8 +706,10 @@ def update_user_settings():
     try:
         with db.cursor() as cur:
             app_password = data.get('app_password', '').replace(' ', '').strip() or None
-            avatar = data.get('avatar', None)
-            name   = data.get('name', None)
+            avatar      = data.get('avatar', None)
+            name        = data.get('name', None)
+            theme_color = data.get('theme_color', None) or None
+            font_family = data.get('font_family', None) or None
             if app_password:
                 cur.execute(
                     """UPDATE users SET
@@ -715,19 +720,14 @@ def update_user_settings():
                         green_api_instance = %s,
                         green_api_token = %s,
                         app_password = %s,
-                        avatar = COALESCE(%s, avatar)
+                        avatar = COALESCE(%s, avatar),
+                        theme_color = COALESCE(%s, theme_color),
+                        font_family = COALESCE(%s, font_family)
                     WHERE email = %s AND is_verified = 1""",
-                    (
-                        name,
-                        data.get('phone'),
-                        data.get('gmail_address'),
-                        data.get('telegram_chat_id'),
-                        data.get('green_api_instance'),
-                        data.get('green_api_token'),
-                        app_password,
-                        avatar,
-                        email,
-                    )
+                    (name, data.get('phone'), data.get('gmail_address'),
+                     data.get('telegram_chat_id'), data.get('green_api_instance'),
+                     data.get('green_api_token'), app_password,
+                     avatar, theme_color, font_family, email)
                 )
             else:
                 cur.execute(
@@ -738,18 +738,14 @@ def update_user_settings():
                         telegram_chat_id = %s,
                         green_api_instance = %s,
                         green_api_token = %s,
-                        avatar = COALESCE(%s, avatar)
+                        avatar = COALESCE(%s, avatar),
+                        theme_color = COALESCE(%s, theme_color),
+                        font_family = COALESCE(%s, font_family)
                     WHERE email = %s AND is_verified = 1""",
-                    (
-                        name,
-                        data.get('phone'),
-                        data.get('gmail_address'),
-                        data.get('telegram_chat_id'),
-                        data.get('green_api_instance'),
-                        data.get('green_api_token'),
-                        avatar,
-                        email,
-                    )
+                    (name, data.get('phone'), data.get('gmail_address'),
+                     data.get('telegram_chat_id'), data.get('green_api_instance'),
+                     data.get('green_api_token'),
+                     avatar, theme_color, font_family, email)
                 )
         db.commit()
         return jsonify({"success": True})
