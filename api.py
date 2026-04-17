@@ -388,9 +388,26 @@ def forgot_password():
             user = cur.fetchone()
             print(f"[DEBUG] User found: {user}")
             
+            # Vérifications robustes pour RealDictCursor
             if not user:
                 print(f"[DEBUG] No user found with email: {email}")
                 return jsonify({'error': 'Aucun compte trouvé avec cet email'}), 404
+            
+            # Vérifier que user contient les clés nécessaires
+            if not isinstance(user, dict):
+                print(f"[ERROR] User is not a dict: {type(user)}")
+                return jsonify({'error': 'Erreur de format de données utilisateur'}), 500
+            
+            if 'id' not in user or 'name' not in user:
+                print(f"[ERROR] Missing user keys: {list(user.keys())}")
+                return jsonify({'error': 'Données utilisateur incomplètes'}), 500
+            
+            user_id = user.get('id')
+            user_name = user.get('name')
+            
+            if not user_id or not user_name:
+                print(f"[ERROR] Invalid user data - id: {user_id}, name: {user_name}")
+                return jsonify({'error': 'Données utilisateur invalides'}), 500
             
             # 5. Génération et sauvegarde OTP
             otp = str(random.randint(100000, 999999))
@@ -406,7 +423,7 @@ def forgot_password():
             cur.execute("""
                 INSERT INTO otp_codes (email, code, name, expires_at)
                 VALUES (%s, %s, %s, %s)
-            """, (email, otp, user[1], expires_at))
+            """, (email, otp, user_name, expires_at))
             
             db.commit()
             print(f"[DEBUG] Database commit successful")
@@ -416,7 +433,7 @@ def forgot_password():
                 print(f"[DEBUG] Sending email to {email}")
                 print(f"[DEBUG] SMTP_EMAIL: {SMTP_EMAIL}")
                 
-                send_otp_email(email, user[1], otp, is_reset=True)
+                send_otp_email(email, user_name, otp, is_reset=True)
                 print(f"[DEBUG] Email sent successfully")
                 
             except Exception as email_error:
