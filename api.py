@@ -126,6 +126,7 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_token TEXT")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_history_id VARCHAR(50)")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS app_password VARCHAR(200)")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT")
             # Promouvoir l'admin principal
             cur.execute("UPDATE users SET role='admin' WHERE email='kyliyanisse@gmail.com'")
             cur.execute("""
@@ -668,7 +669,7 @@ def get_user_settings():
     try:
         with db.cursor() as cur:
             cur.execute(
-                "SELECT name, email, phone, gmail_address, telegram_chat_id, green_api_instance, green_api_token, app_password "
+                "SELECT name, email, phone, gmail_address, telegram_chat_id, green_api_instance, green_api_token, app_password, avatar "
                 "FROM users WHERE email = %s AND is_verified = 1",
                 (email,)
             )
@@ -678,12 +679,14 @@ def get_user_settings():
                 "name": "", "email": email, "phone": "",
                 "gmail_address": "", "telegram_chat_id": "",
                 "green_api_instance": "", "green_api_token": "",
-                "app_password_set": False
+                "app_password_set": False, "avatar": ""
             })
         user = dict(user)
         for key in ["phone", "gmail_address", "telegram_chat_id", "green_api_instance", "green_api_token"]:
             if user.get(key) is None:
                 user[key] = ""
+        if user.get('avatar') is None:
+            user['avatar'] = ""
         user['app_password_set'] = bool(user.pop('app_password', None))
         return jsonify(user)
     finally:
@@ -700,41 +703,51 @@ def update_user_settings():
     try:
         with db.cursor() as cur:
             app_password = data.get('app_password', '').replace(' ', '').strip() or None
+            avatar = data.get('avatar', None)
+            name   = data.get('name', None)
             if app_password:
                 cur.execute(
                     """UPDATE users SET
+                        name = COALESCE(%s, name),
                         phone = %s,
                         gmail_address = %s,
                         telegram_chat_id = %s,
                         green_api_instance = %s,
                         green_api_token = %s,
-                        app_password = %s
+                        app_password = %s,
+                        avatar = COALESCE(%s, avatar)
                     WHERE email = %s AND is_verified = 1""",
                     (
+                        name,
                         data.get('phone'),
                         data.get('gmail_address'),
                         data.get('telegram_chat_id'),
                         data.get('green_api_instance'),
                         data.get('green_api_token'),
                         app_password,
+                        avatar,
                         email,
                     )
                 )
             else:
                 cur.execute(
                     """UPDATE users SET
+                        name = COALESCE(%s, name),
                         phone = %s,
                         gmail_address = %s,
                         telegram_chat_id = %s,
                         green_api_instance = %s,
-                        green_api_token = %s
+                        green_api_token = %s,
+                        avatar = COALESCE(%s, avatar)
                     WHERE email = %s AND is_verified = 1""",
                     (
+                        name,
                         data.get('phone'),
                         data.get('gmail_address'),
                         data.get('telegram_chat_id'),
                         data.get('green_api_instance'),
                         data.get('green_api_token'),
+                        avatar,
                         email,
                     )
                 )
