@@ -170,45 +170,63 @@ def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
 def send_otp_email(to_email, name, otp_code, is_reset=False):
-    msg = MIMEMultipart('alternative')
+    print(f"[DEBUG] send_otp_email called for: {to_email}, is_reset: {is_reset}")
     
-    if is_reset:
-        msg['Subject'] = f'Votre code de réinitialisation MailNotifier : {otp_code}'
-    else:
-        msg['Subject'] = f'Votre code de verification MailNotifier : {otp_code}'
-    
-    msg['From']    = SMTP_EMAIL
-    msg['To']      = to_email
+    try:
+        msg = MIMEMultipart('alternative')
+        
+        if is_reset:
+            msg['Subject'] = f'Votre code de réinitialisation MailNotifier : {otp_code}'
+        else:
+            msg['Subject'] = f'Votre code de verification MailNotifier : {otp_code}'
+        
+        msg['From']    = SMTP_EMAIL
+        msg['To']      = to_email
 
-    if is_reset:
-        title_text = "Réinitialisation de votre mot de passe"
-        instruction_text = "Voici votre code de réinitialisation :"
-    else:
-        title_text = "Verification de votre compte"
-        instruction_text = "Voici votre code de verification :"
-    
-    html = f"""
-    <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#f5f5f5;border-radius:16px;">
-      <div style="text-align:center;margin-bottom:24px;">
-        <h1 style="color:#1a237e;margin:0;">MailNotifier</h1>
-        <p style="color:#666;margin:4px 0;">{title_text}</p>
-      </div>
-      <div style="background:white;border-radius:12px;padding:32px;text-align:center;">
-        <p style="color:#333;font-size:16px;">Bonjour <strong>{name}</strong>,</p>
-        <p style="color:#555;font-size:14px;">{instruction_text}</p>
-        <div style="background:#e8eaf6;border-radius:12px;padding:24px;margin:24px 0;">
-          <span style="font-size:42px;font-weight:900;letter-spacing:12px;color:#1a237e;">{otp_code}</span>
+        if is_reset:
+            title_text = "Réinitialisation de votre mot de passe"
+            instruction_text = "Voici votre code de réinitialisation :"
+        else:
+            title_text = "Verification de votre compte"
+            instruction_text = "Voici votre code de verification :"
+        
+        html = f"""
+        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#f5f5f5;border-radius:16px;">
+          <div style="text-align:center;margin-bottom:24px;">
+            <h1 style="color:#1a237e;margin:0;">MailNotifier</h1>
+            <p style="color:#666;margin:4px 0;">{title_text}</p>
+          </div>
+          <div style="background:white;border-radius:12px;padding:32px;text-align:center;">
+            <p style="color:#333;font-size:16px;">Bonjour <strong>{name}</strong>,</p>
+            <p style="color:#555;font-size:14px;">{instruction_text}</p>
+            <div style="background:#e8eaf6;border-radius:12px;padding:24px;margin:24px 0;">
+              <span style="font-size:42px;font-weight:900;letter-spacing:12px;color:#1a237e;">{otp_code}</span>
+            </div>
+            <p style="color:#888;font-size:13px;">Ce code expire dans <strong>15 minutes</strong>.</p>
+            <p style="color:#bbb;font-size:12px;">Si vous n'avez pas fait cette demande, ignorez cet email.</p>
+          </div>
         </div>
-        <p style="color:#888;font-size:13px;">Ce code expire dans <strong>15 minutes</strong>.</p>
-        <p style="color:#bbb;font-size:12px;">Si vous n'avez pas fait cette demande, ignorez cet email.</p>
-      </div>
-    </div>
-    """
-    msg.attach(MIMEText(html, 'html'))
-    ctx = create_default_context()
-    with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=ctx) as server:
-        server.login(SMTP_EMAIL, SMTP_PASSWORD)
-        server.sendmail(SMTP_EMAIL, to_email, msg.as_string())
+        """
+        msg.attach(MIMEText(html, 'html'))
+        
+        print(f"[DEBUG] Attempting SMTP connection to smtp.gmail.com:465")
+        print(f"[DEBUG] SMTP_EMAIL: {SMTP_EMAIL}")
+        print(f"[DEBUG] SMTP_PASSWORD configured: {'Yes' if SMTP_PASSWORD else 'No'}")
+        
+        ctx = create_default_context()
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=ctx) as server:
+            print(f"[DEBUG] SMTP connection successful")
+            server.login(SMTP_EMAIL, SMTP_PASSWORD)
+            print(f"[DEBUG] SMTP login successful")
+            server.sendmail(SMTP_EMAIL, to_email, msg.as_string())
+            print(f"[DEBUG] Email sent successfully to {to_email}")
+            
+    except Exception as e:
+        print(f"[ERROR] send_otp_email failed: {e}")
+        print(f"[ERROR] Exception type: {type(e)}")
+        import traceback
+        print(f"[ERROR] Full traceback: {traceback.format_exc()}")
+        raise e
 
 
 # ─── AUTH ROUTES ──────────────────────────────────────────────────────────────
@@ -330,45 +348,73 @@ def verify_otp():
 @app.route('/api/auth/forgot-password', methods=['POST'])
 def forgot_password():
     """Génère un code OTP pour la réinitialisation du mot de passe."""
-    data = request.json
+    print(f"[DEBUG] ForgotPassword - Request received")
+    
+    # 1. Vérifier la réception des données
+    try:
+        data = request.json
+        print(f"[DEBUG] Request data: {data}")
+    except Exception as e:
+        print(f"[DEBUG] Error parsing JSON: {e}")
+        return jsonify({'error': 'Données invalides'}), 400
+    
     email = data.get('email', '').strip().lower()
+    print(f"[DEBUG] Extracted email: '{email}'")
     
     if not email or '@' not in email or '.' not in email:
+        print(f"[DEBUG] Invalid email format")
         return jsonify({'error': 'Adresse email invalide (ex: exemple@gmail.com)'}), 400
     
     try:
+        print(f"[DEBUG] Connecting to database...")
         db = get_db()
         with db.cursor() as cur:
-            # Vérifier si l'utilisateur existe
+            # 2. Vérifier si l'utilisateur existe
+            print(f"[DEBUG] Checking if user exists for email: {email}")
             cur.execute("SELECT id, name FROM users WHERE email = %s AND is_verified = 1", (email,))
             user = cur.fetchone()
+            print(f"[DEBUG] User found: {user}")
             
             if not user:
+                print(f"[DEBUG] No user found with email: {email}")
                 return jsonify({'error': 'Aucun compte trouvé avec cet email'}), 404
             
-            # Générer et sauvegarder le code OTP
+            # 3. Générer et sauvegarder le code OTP
             otp = str(random.randint(100000, 999999))
             expires_at = datetime.now() + timedelta(minutes=15)
+            print(f"[DEBUG] Generated OTP: {otp}, expires: {expires_at}")
             
             # Supprimer anciens codes OTP pour cet email
+            print(f"[DEBUG] Deleting old OTP codes for {email}")
             cur.execute("DELETE FROM otp_codes WHERE email = %s", (email,))
             
             # Insérer nouveau code OTP avec flag de réinitialisation
+            print(f"[DEBUG] Inserting new OTP code")
             cur.execute("""
                 INSERT INTO otp_codes (email, code, name, expires_at)
                 VALUES (%s, %s, %s, %s)
             """, (email, otp, user[1], expires_at))
             
             db.commit()
+            print(f"[DEBUG] Database commit successful")
             
-            # Envoyer l'email avec le code (utiliser la même fonction que register)
+            # 4. Envoyer l'email avec le code
+            print(f"[DEBUG] Sending email to {email}")
+            print(f"[DEBUG] SMTP_EMAIL configured: {SMTP_EMAIL}")
+            print(f"[DEBUG] SMTP_PASSWORD configured: {'Yes' if SMTP_PASSWORD else 'No'}")
+            
             send_otp_email(email, user[1], otp, is_reset=True)
+            print(f"[DEBUG] Email sent successfully")
             
         db.close()
+        print(f"[DEBUG] ForgotPassword process completed successfully")
         return jsonify({'message': f'Code de réinitialisation envoyé à {email}'}), 200
         
     except Exception as e:
-        print(f"[ForgotPassword] Error: {e}")
+        print(f"[DEBUG] ForgotPassword Exception: {e}")
+        print(f"[DEBUG] Exception type: {type(e)}")
+        import traceback
+        print(f"[DEBUG] Full traceback: {traceback.format_exc()}")
         return jsonify({'error': 'Erreur lors de la génération du code'}), 500
 
 
