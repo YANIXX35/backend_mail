@@ -333,8 +333,8 @@ def forgot_password():
     data = request.json
     email = data.get('email', '').strip().lower()
     
-    if not email or '@' not in email:
-        return jsonify({'error': 'Adresse email invalide'}), 400
+    if not email or '@' not in email or '.' not in email:
+        return jsonify({'error': 'Adresse email invalide (ex: exemple@gmail.com)'}), 400
     
     try:
         db = get_db()
