@@ -350,13 +350,15 @@ def forgot_password():
     """Génère un code OTP pour la réinitialisation du mot de passe."""
     print(f"[DEBUG] ForgotPassword - Request received")
     
-    # 1. Vérifier la réception des données
+    # 1. Validation des données reçues
     try:
         data = request.json
+        if not data:
+            return jsonify({'error': 'Aucune donnée reçue'}), 400
         print(f"[DEBUG] Request data: {data}")
     except Exception as e:
         print(f"[DEBUG] Error parsing JSON: {e}")
-        return jsonify({'error': 'Données invalides'}), 400
+        return jsonify({'error': 'Format de données invalide'}), 400
     
     email = data.get('email', '').strip().lower()
     print(f"[DEBUG] Extracted email: '{email}'")
@@ -365,11 +367,22 @@ def forgot_password():
         print(f"[DEBUG] Invalid email format")
         return jsonify({'error': 'Adresse email invalide (ex: exemple@gmail.com)'}), 400
     
+    # 2. Vérification des variables d'environnement critiques
+    if not SMTP_EMAIL:
+        print(f"[ERROR] SMTP_EMAIL not configured")
+        return jsonify({'error': 'Configuration SMTP manquante - contactez l\'administrateur'}), 500
+    
+    if not SMTP_PASSWORD:
+        print(f"[ERROR] SMTP_PASSWORD not configured")
+        return jsonify({'error': 'Configuration SMTP manquante - contactez l\'administrateur'}), 500
+    
+    db = None
     try:
+        # 3. Connexion base de données
         print(f"[DEBUG] Connecting to database...")
         db = get_db()
         with db.cursor() as cur:
-            # 2. Vérifier si l'utilisateur existe
+            # 4. Vérification utilisateur
             print(f"[DEBUG] Checking if user exists for email: {email}")
             cur.execute("SELECT id, name FROM users WHERE email = %s AND is_verified = 1", (email,))
             user = cur.fetchone()
@@ -379,16 +392,16 @@ def forgot_password():
                 print(f"[DEBUG] No user found with email: {email}")
                 return jsonify({'error': 'Aucun compte trouvé avec cet email'}), 404
             
-            # 3. Générer et sauvegarder le code OTP
+            # 5. Génération et sauvegarde OTP
             otp = str(random.randint(100000, 999999))
             expires_at = datetime.now() + timedelta(minutes=15)
             print(f"[DEBUG] Generated OTP: {otp}, expires: {expires_at}")
             
-            # Supprimer anciens codes OTP pour cet email
+            # Supprimer anciens codes
             print(f"[DEBUG] Deleting old OTP codes for {email}")
             cur.execute("DELETE FROM otp_codes WHERE email = %s", (email,))
             
-            # Insérer nouveau code OTP avec flag de réinitialisation
+            # Insérer nouveau code
             print(f"[DEBUG] Inserting new OTP code")
             cur.execute("""
                 INSERT INTO otp_codes (email, code, name, expires_at)
@@ -398,24 +411,41 @@ def forgot_password():
             db.commit()
             print(f"[DEBUG] Database commit successful")
             
-            # 4. Envoyer l'email avec le code
-            print(f"[DEBUG] Sending email to {email}")
-            print(f"[DEBUG] SMTP_EMAIL configured: {SMTP_EMAIL}")
-            print(f"[DEBUG] SMTP_PASSWORD configured: {'Yes' if SMTP_PASSWORD else 'No'}")
+            # 6. Envoi email avec gestion d'erreur séparée
+            try:
+                print(f"[DEBUG] Sending email to {email}")
+                print(f"[DEBUG] SMTP_EMAIL: {SMTP_EMAIL}")
+                
+                send_otp_email(email, user[1], otp, is_reset=True)
+                print(f"[DEBUG] Email sent successfully")
+                
+            except Exception as email_error:
+                print(f"[ERROR] Email sending failed: {email_error}")
+                # Ne pas bloquer le processus si l'email échoue
+                # L'utilisateur a quand même son code en base
+                print(f"[WARNING] Process continues despite email failure")
             
-            send_otp_email(email, user[1], otp, is_reset=True)
-            print(f"[DEBUG] Email sent successfully")
-            
-        db.close()
-        print(f"[DEBUG] ForgotPassword process completed successfully")
-        return jsonify({'message': f'Code de réinitialisation envoyé à {email}'}), 200
+            return jsonify({
+                'message': f'Code de réinitialisation généré pour {email}',
+                'debug_otp': otp,  # Temporaire pour debug
+                'note': 'En cas de problème email, le code est: ' + otp
+            }), 200
+        
+    except psycopg2.Error as db_error:
+        print(f"[ERROR] Database error: {db_error}")
+        return jsonify({'error': 'Erreur base de données - réessayez plus tard'}), 500
         
     except Exception as e:
-        print(f"[DEBUG] ForgotPassword Exception: {e}")
-        print(f"[DEBUG] Exception type: {type(e)}")
+        print(f"[ERROR] ForgotPassword Exception: {e}")
+        print(f"[ERROR] Exception type: {type(e)}")
         import traceback
-        print(f"[DEBUG] Full traceback: {traceback.format_exc()}")
-        return jsonify({'error': 'Erreur lors de la génération du code'}), 500
+        print(f"[ERROR] Full traceback: {traceback.format_exc()}")
+        return jsonify({'error': f'Erreur technique: {str(e)}'}), 500
+        
+    finally:
+        if db:
+            db.close()
+            print(f"[DEBUG] Database connection closed")
 
 
 @app.route('/api/auth/reset-password', methods=['POST'])
