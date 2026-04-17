@@ -23,13 +23,16 @@ import psycopg2.extras
 load_dotenv()
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB max request body
 CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
 
 @app.after_request
 def add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Cache-Control, Pragma'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
     return response
 
 @app.route('/api/<path:path>', methods=['OPTIONS'])
@@ -127,6 +130,8 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_history_id VARCHAR(50)")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS app_password VARCHAR(200)")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS theme_color VARCHAR(20)")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS font_family VARCHAR(60)")
             # Promouvoir l'admin principal
             cur.execute("UPDATE users SET role='admin' WHERE email='kyliyanisse@gmail.com'")
             cur.execute("""
@@ -164,25 +169,37 @@ def init_db():
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-def send_otp_email(to_email, name, otp_code):
+def send_otp_email(to_email, name, otp_code, is_reset=False):
     msg = MIMEMultipart('alternative')
-    msg['Subject'] = f'Votre code de verification MailNotifier : {otp_code}'
+    
+    if is_reset:
+        msg['Subject'] = f'Votre code de réinitialisation MailNotifier : {otp_code}'
+    else:
+        msg['Subject'] = f'Votre code de verification MailNotifier : {otp_code}'
+    
     msg['From']    = SMTP_EMAIL
     msg['To']      = to_email
 
+    if is_reset:
+        title_text = "Réinitialisation de votre mot de passe"
+        instruction_text = "Voici votre code de réinitialisation :"
+    else:
+        title_text = "Verification de votre compte"
+        instruction_text = "Voici votre code de verification :"
+    
     html = f"""
     <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#f5f5f5;border-radius:16px;">
       <div style="text-align:center;margin-bottom:24px;">
         <h1 style="color:#1a237e;margin:0;">MailNotifier</h1>
-        <p style="color:#666;margin:4px 0;">Verification de votre compte</p>
+        <p style="color:#666;margin:4px 0;">{title_text}</p>
       </div>
       <div style="background:white;border-radius:12px;padding:32px;text-align:center;">
         <p style="color:#333;font-size:16px;">Bonjour <strong>{name}</strong>,</p>
-        <p style="color:#555;font-size:14px;">Voici votre code de verification :</p>
+        <p style="color:#555;font-size:14px;">{instruction_text}</p>
         <div style="background:#e8eaf6;border-radius:12px;padding:24px;margin:24px 0;">
           <span style="font-size:42px;font-weight:900;letter-spacing:12px;color:#1a237e;">{otp_code}</span>
         </div>
-        <p style="color:#888;font-size:13px;">Ce code expire dans <strong>10 minutes</strong>.</p>
+        <p style="color:#888;font-size:13px;">Ce code expire dans <strong>15 minutes</strong>.</p>
         <p style="color:#bbb;font-size:12px;">Si vous n'avez pas fait cette demande, ignorez cet email.</p>
       </div>
     </div>
@@ -308,6 +325,103 @@ def verify_otp():
             return jsonify({'message': 'Compte cree avec succes !', 'name': otp['name']}), 201
     finally:
         db.close()
+
+
+@app.route('/api/auth/forgot-password', methods=['POST'])
+def forgot_password():
+    """Génère un code OTP pour la réinitialisation du mot de passe."""
+    data = request.json
+    email = data.get('email', '').strip().lower()
+    
+    if not email or '@' not in email:
+        return jsonify({'error': 'Adresse email invalide'}), 400
+    
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            # Vérifier si l'utilisateur existe
+            cur.execute("SELECT id, name FROM users WHERE email = %s AND is_verified = 1", (email,))
+            user = cur.fetchone()
+            
+            if not user:
+                return jsonify({'error': 'Aucun compte trouvé avec cet email'}), 404
+            
+            # Générer et sauvegarder le code OTP
+            otp = str(random.randint(100000, 999999))
+            expires_at = datetime.now() + timedelta(minutes=15)
+            
+            # Supprimer anciens codes OTP pour cet email
+            cur.execute("DELETE FROM otp_codes WHERE email = %s", (email,))
+            
+            # Insérer nouveau code OTP avec flag de réinitialisation
+            cur.execute("""
+                INSERT INTO otp_codes (email, code, name, expires_at)
+                VALUES (%s, %s, %s, %s)
+            """, (email, otp, user[1], expires_at))
+            
+            db.commit()
+            
+            # Envoyer l'email avec le code (utiliser la même fonction que register)
+            send_otp_email(email, user[1], otp, is_reset=True)
+            
+        db.close()
+        return jsonify({'message': f'Code de réinitialisation envoyé à {email}'}), 200
+        
+    except Exception as e:
+        print(f"[ForgotPassword] Error: {e}")
+        return jsonify({'error': 'Erreur lors de la génération du code'}), 500
+
+
+@app.route('/api/auth/reset-password', methods=['POST'])
+def reset_password():
+    """Réinitialise le mot de passe avec le code OTP."""
+    data = request.json
+    email = data.get('email', '').strip().lower()
+    code = data.get('code', '').strip()
+    new_password = data.get('newPassword', '').strip()
+    
+    if not email or '@' not in email:
+        return jsonify({'error': 'Adresse email invalide'}), 400
+    
+    if not code or len(code) != 6:
+        return jsonify({'error': 'Code de réinitialisation invalide'}), 400
+    
+    if not new_password or len(new_password) < 6:
+        return jsonify({'error': 'Le mot de passe doit contenir au moins 6 caractères'}), 400
+    
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            # Vérifier le code OTP
+            cur.execute("""
+                SELECT id FROM otp_codes 
+                WHERE email = %s AND code = %s AND expires_at > NOW()
+            """, (email, code))
+            
+            otp_record = cur.fetchone()
+            if not otp_record:
+                return jsonify({'error': 'Code invalide ou expiré'}), 400
+            
+            # Hasher le nouveau mot de passe
+            hashed_password = hashlib.sha256(new_password.encode()).hexdigest()
+            
+            # Mettre à jour le mot de passe
+            cur.execute("""
+                UPDATE users SET password = %s 
+                WHERE email = %s AND is_verified = 1
+            """, (hashed_password, email))
+            
+            # Supprimer le code OTP utilisé
+            cur.execute("DELETE FROM otp_codes WHERE email = %s", (email,))
+            
+            db.commit()
+            
+        db.close()
+        return jsonify({'message': 'Mot de passe réinitialisé avec succès'}), 200
+        
+    except Exception as e:
+        print(f"[ResetPassword] Error: {e}")
+        return jsonify({'error': 'Erreur lors de la réinitialisation'}), 500
 
 
 @app.route('/api/auth/login', methods=['POST'])
@@ -669,7 +783,8 @@ def get_user_settings():
     try:
         with db.cursor() as cur:
             cur.execute(
-                "SELECT name, email, phone, gmail_address, telegram_chat_id, green_api_instance, green_api_token, app_password, avatar "
+                "SELECT name, email, phone, gmail_address, telegram_chat_id, green_api_instance, "
+                "green_api_token, app_password, avatar, theme_color, font_family "
                 "FROM users WHERE email = %s AND is_verified = 1",
                 (email,)
             )
@@ -679,14 +794,14 @@ def get_user_settings():
                 "name": "", "email": email, "phone": "",
                 "gmail_address": "", "telegram_chat_id": "",
                 "green_api_instance": "", "green_api_token": "",
-                "app_password_set": False, "avatar": ""
+                "app_password_set": False, "avatar": "",
+                "theme_color": "", "font_family": ""
             })
         user = dict(user)
-        for key in ["phone", "gmail_address", "telegram_chat_id", "green_api_instance", "green_api_token"]:
+        for key in ["phone", "gmail_address", "telegram_chat_id", "green_api_instance",
+                    "green_api_token", "avatar", "theme_color", "font_family"]:
             if user.get(key) is None:
                 user[key] = ""
-        if user.get('avatar') is None:
-            user['avatar'] = ""
         user['app_password_set'] = bool(user.pop('app_password', None))
         return jsonify(user)
     finally:
@@ -703,8 +818,10 @@ def update_user_settings():
     try:
         with db.cursor() as cur:
             app_password = data.get('app_password', '').replace(' ', '').strip() or None
-            avatar = data.get('avatar', None)
-            name   = data.get('name', None)
+            avatar      = data.get('avatar', None)
+            name        = data.get('name', None)
+            theme_color = data.get('theme_color', None) or None
+            font_family = data.get('font_family', None) or None
             if app_password:
                 cur.execute(
                     """UPDATE users SET
@@ -715,19 +832,14 @@ def update_user_settings():
                         green_api_instance = %s,
                         green_api_token = %s,
                         app_password = %s,
-                        avatar = COALESCE(%s, avatar)
+                        avatar = COALESCE(%s, avatar),
+                        theme_color = COALESCE(%s, theme_color),
+                        font_family = COALESCE(%s, font_family)
                     WHERE email = %s AND is_verified = 1""",
-                    (
-                        name,
-                        data.get('phone'),
-                        data.get('gmail_address'),
-                        data.get('telegram_chat_id'),
-                        data.get('green_api_instance'),
-                        data.get('green_api_token'),
-                        app_password,
-                        avatar,
-                        email,
-                    )
+                    (name, data.get('phone'), data.get('gmail_address'),
+                     data.get('telegram_chat_id'), data.get('green_api_instance'),
+                     data.get('green_api_token'), app_password,
+                     avatar, theme_color, font_family, email)
                 )
             else:
                 cur.execute(
@@ -738,18 +850,14 @@ def update_user_settings():
                         telegram_chat_id = %s,
                         green_api_instance = %s,
                         green_api_token = %s,
-                        avatar = COALESCE(%s, avatar)
+                        avatar = COALESCE(%s, avatar),
+                        theme_color = COALESCE(%s, theme_color),
+                        font_family = COALESCE(%s, font_family)
                     WHERE email = %s AND is_verified = 1""",
-                    (
-                        name,
-                        data.get('phone'),
-                        data.get('gmail_address'),
-                        data.get('telegram_chat_id'),
-                        data.get('green_api_instance'),
-                        data.get('green_api_token'),
-                        avatar,
-                        email,
-                    )
+                    (name, data.get('phone'), data.get('gmail_address'),
+                     data.get('telegram_chat_id'), data.get('green_api_instance'),
+                     data.get('green_api_token'),
+                     avatar, theme_color, font_family, email)
                 )
         db.commit()
         return jsonify({"success": True})
