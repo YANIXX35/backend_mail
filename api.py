@@ -1,5 +1,6 @@
 print("=== MailNotifier API v3.0 - MONITOR ACTIF ===")
 import os
+import re
 import time
 import random
 import smtplib
@@ -19,20 +20,45 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
+import bcrypt
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 load_dotenv()
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB max request body
-CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
+
+# CORS restreint aux origines connues
+ALLOWED_ORIGINS = [
+    "https://yanixx35.github.io",
+    "http://localhost:4200",
+    "http://localhost:4201",
+]
+CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=False)
+
+# Rate limiting (mémoire locale — réinitialisé au redémarrage)
+# Désactivé en environnement de test (TESTING=1) pour éviter les conflits avec threading mocks
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri="memory://",
+    enabled=not bool(os.getenv('TESTING')),
+)
 
 @app.after_request
-def add_cors_headers(response):
-    response.headers['Access-Control-Allow-Origin'] = '*'
+def add_security_headers(response):
+    origin = request.headers.get('Origin', '')
+    if origin in ALLOWED_ORIGINS:
+        response.headers['Access-Control-Allow-Origin'] = origin
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Cache-Control, Pragma'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
     response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
     response.headers['Pragma'] = 'no-cache'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
     return response
 
 @app.route('/api/<path:path>', methods=['OPTIONS'])
@@ -91,16 +117,44 @@ def telegram_bot_polling():
 
 # ─── DATABASE ─────────────────────────────────────────────────────────────────
 
+_DB_PARAMS = dict(
+    host=os.getenv('DB_HOST'),
+    port=int(os.getenv('DB_PORT', 5432)),
+    user=os.getenv('DB_USER', 'avnadmin'),
+    password=os.getenv('DB_PASSWORD'),
+    dbname=os.getenv('DB_NAME', 'defaultdb'),
+    sslmode='require',
+    connect_timeout=10,
+    cursor_factory=psycopg2.extras.RealDictCursor,
+)
+
+# Connexion pool — 2 min, 10 max (Render free tier: max 25 connexions)
+_db_pool = None
+
+def _get_pool():
+    global _db_pool
+    if _db_pool is None:
+        _db_pool = psycopg2.pool.ThreadedConnectionPool(2, 10, **_DB_PARAMS)
+    return _db_pool
+
 def get_db():
-    return psycopg2.connect(
-        host=os.getenv('DB_HOST'),
-        port=int(os.getenv('DB_PORT', 5432)),
-        user=os.getenv('DB_USER', 'avnadmin'),
-        password=os.getenv('DB_PASSWORD'),
-        dbname=os.getenv('DB_NAME', 'defaultdb'),
-        sslmode='require',
-        cursor_factory=psycopg2.extras.RealDictCursor
-    )
+    """Retourne une connexion depuis le pool (à rendre avec _return_db(db))."""
+    try:
+        return _get_pool().getconn()
+    except Exception:
+        # Fallback direct si le pool n'est pas disponible (e.g. tests)
+        return psycopg2.connect(**_DB_PARAMS)
+
+def _return_db(conn):
+    """Remet la connexion dans le pool plutôt que de la fermer."""
+    try:
+        pool = _get_pool()
+        pool.putconn(conn)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 def init_db():
     """Crée les tables si elles n'existent pas."""
@@ -159,76 +213,124 @@ def init_db():
         db.commit()
         print("Tables verifiees/creees avec succes.")
     finally:
-        db.close()
+        _return_db(db)
 
 
 
 
 # ─── UTILS ────────────────────────────────────────────────────────────────────
 
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
+def hash_password(password: str) -> str:
+    """Hache le mot de passe avec bcrypt (coût 12)."""
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    """
+    Vérifie le mot de passe contre le hash stocké.
+    Gère la migration transparente : anciens comptes SHA256 → bcrypt.
+    """
+    try:
+        # Nouveau format : hash bcrypt ($2b$...)
+        if stored_hash.startswith('$2b$') or stored_hash.startswith('$2a$'):
+            return bcrypt.checkpw(password.encode(), stored_hash.encode())
+        # Ancien format : SHA256 hexdigest (64 chars hex)
+        import hashlib
+        return stored_hash == hashlib.sha256(password.encode()).hexdigest()
+    except Exception:
+        return False
+
+# ─── VALIDATION ───────────────────────────────────────────────────────────────
+
+_EMAIL_RE = re.compile(r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$')
+
+def _is_valid_email(value: str) -> bool:
+    return bool(value and _EMAIL_RE.match(value) and len(value) <= 150)
+
+def _check_password(password) -> str | None:
+    """Returns error message if invalid, None if ok."""
+    if not password or not isinstance(password, str):
+        return 'Mot de passe requis'
+    if len(password) < 8:
+        return 'Mot de passe trop court (minimum 8 caractères)'
+    if len(password) > 128:
+        return 'Mot de passe trop long (maximum 128 caractères)'
+    return None
+
+def _str(value, max_len: int = 200) -> str:
+    """Safely coerce a field to string, strip whitespace, truncate."""
+    return str(value or '').strip()[:max_len]
+
 
 def send_otp_email(to_email, name, otp_code, is_reset=False):
-    msg = MIMEMultipart('alternative')
-    
-    if is_reset:
-        msg['Subject'] = f'Votre code de réinitialisation MailNotifier : {otp_code}'
-    else:
-        msg['Subject'] = f'Votre code de verification MailNotifier : {otp_code}'
-    
-    msg['From']    = SMTP_EMAIL
-    msg['To']      = to_email
+    try:
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = (
+            f'Votre code de réinitialisation MailNotifier : {otp_code}'
+            if is_reset else
+            f'Votre code de verification MailNotifier : {otp_code}'
+        )
+        msg['From'] = SMTP_EMAIL
+        msg['To']   = to_email
 
-    if is_reset:
-        title_text = "Réinitialisation de votre mot de passe"
-        instruction_text = "Voici votre code de réinitialisation :"
-    else:
-        title_text = "Verification de votre compte"
-        instruction_text = "Voici votre code de verification :"
-    
-    html = f"""
-    <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#f5f5f5;border-radius:16px;">
-      <div style="text-align:center;margin-bottom:24px;">
-        <h1 style="color:#1a237e;margin:0;">MailNotifier</h1>
-        <p style="color:#666;margin:4px 0;">{title_text}</p>
-      </div>
-      <div style="background:white;border-radius:12px;padding:32px;text-align:center;">
-        <p style="color:#333;font-size:16px;">Bonjour <strong>{name}</strong>,</p>
-        <p style="color:#555;font-size:14px;">{instruction_text}</p>
-        <div style="background:#e8eaf6;border-radius:12px;padding:24px;margin:24px 0;">
-          <span style="font-size:42px;font-weight:900;letter-spacing:12px;color:#1a237e;">{otp_code}</span>
+        title_text       = "Réinitialisation de votre mot de passe" if is_reset else "Verification de votre compte"
+        instruction_text = "Voici votre code de réinitialisation :" if is_reset else "Voici votre code de verification :"
+
+        html = f"""
+        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#f5f5f5;border-radius:16px;">
+          <div style="text-align:center;margin-bottom:24px;">
+            <h1 style="color:#1a237e;margin:0;">MailNotifier</h1>
+            <p style="color:#666;margin:4px 0;">{title_text}</p>
+          </div>
+          <div style="background:white;border-radius:12px;padding:32px;text-align:center;">
+            <p style="color:#333;font-size:16px;">Bonjour <strong>{name}</strong>,</p>
+            <p style="color:#555;font-size:14px;">{instruction_text}</p>
+            <div style="background:#e8eaf6;border-radius:12px;padding:24px;margin:24px 0;">
+              <span style="font-size:42px;font-weight:900;letter-spacing:12px;color:#1a237e;">{otp_code}</span>
+            </div>
+            <p style="color:#888;font-size:13px;">Ce code expire dans <strong>15 minutes</strong>.</p>
+            <p style="color:#bbb;font-size:12px;">Si vous n'avez pas fait cette demande, ignorez cet email.</p>
+          </div>
         </div>
-        <p style="color:#888;font-size:13px;">Ce code expire dans <strong>15 minutes</strong>.</p>
-        <p style="color:#bbb;font-size:12px;">Si vous n'avez pas fait cette demande, ignorez cet email.</p>
-      </div>
-    </div>
-    """
-    msg.attach(MIMEText(html, 'html'))
-    ctx = create_default_context()
-    with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=ctx) as server:
-        server.login(SMTP_EMAIL, SMTP_PASSWORD)
-        server.sendmail(SMTP_EMAIL, to_email, msg.as_string())
+        """
+        msg.attach(MIMEText(html, 'html'))
+
+        ctx = create_default_context()
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=ctx) as server:
+            server.login(SMTP_EMAIL, SMTP_PASSWORD)
+            server.sendmail(SMTP_EMAIL, to_email, msg.as_string())
+        print(f"[SMTP] Email envoyé à {to_email}")
+
+    except Exception as e:
+        print(f"[SMTP ERROR] Échec envoi à {to_email}: {type(e).__name__}")
+        raise e
 
 
 # ─── AUTH ROUTES ──────────────────────────────────────────────────────────────
 
 @app.route('/api/auth/register', methods=['POST'])
+@limiter.limit("5 per minute")
 def register():
-    data           = request.json
-    name           = data.get('name', '').strip()
-    email          = data.get('email', '').strip().lower()
-    password       = data.get('password', '')
-    phone          = data.get('phone', '').strip()
-    gmail_address  = data.get('gmail_address', '').strip().lower()
-    telegram_chat_id = data.get('telegram_chat_id', '').strip()
-    green_api_instance = data.get('green_api_instance', '').strip()
-    green_api_token    = data.get('green_api_token', '').strip()
+    data = request.json
+    if not data or not isinstance(data, dict):
+        return jsonify({'error': 'Corps JSON requis'}), 400
 
-    if not name or not email or not password:
-        return jsonify({'error': 'Nom, email et mot de passe requis'}), 400
-    if len(password) < 6:
-        return jsonify({'error': 'Mot de passe trop court (min 6 caracteres)'}), 400
+    name           = _str(data.get('name'), 100)
+    email          = _str(data.get('email'), 150).lower()
+    password       = data.get('password')
+    phone          = _str(data.get('phone'), 30)
+    gmail_address  = _str(data.get('gmail_address'), 150).lower()
+    telegram_chat_id   = _str(data.get('telegram_chat_id'), 50)
+    green_api_instance = _str(data.get('green_api_instance'), 100)
+    green_api_token    = _str(data.get('green_api_token'), 100)
+
+    if not name:
+        return jsonify({'error': 'Nom requis'}), 400
+    if not _is_valid_email(email):
+        return jsonify({'error': 'Adresse email invalide'}), 400
+    pw_error = _check_password(password)
+    if pw_error:
+        return jsonify({'error': pw_error}), 400
+    password = str(password)
 
     db = get_db()
     try:
@@ -258,7 +360,7 @@ def register():
             )
         db.commit()
     finally:
-        db.close()
+        _return_db(db)
 
     def send_async():
         try:
@@ -271,10 +373,19 @@ def register():
 
 
 @app.route('/api/auth/verify-otp', methods=['POST'])
+@limiter.limit("10 per minute")
 def verify_otp():
-    data  = request.json
-    email = data.get('email', '').strip().lower()
-    code  = data.get('code', '').strip()
+    data = request.json
+    if not data or not isinstance(data, dict):
+        return jsonify({'error': 'Corps JSON requis'}), 400
+
+    email = _str(data.get('email'), 150).lower()
+    code  = _str(data.get('code'), 6)
+
+    if not _is_valid_email(email):
+        return jsonify({'error': 'Adresse email invalide'}), 400
+    if not code or not code.isdigit() or len(code) != 6:
+        return jsonify({'error': 'Code OTP invalide (6 chiffres attendus)'}), 400
 
     db = get_db()
     try:
@@ -324,114 +435,130 @@ def verify_otp():
 
             return jsonify({'message': 'Compte cree avec succes !', 'name': otp['name']}), 201
     finally:
-        db.close()
+        _return_db(db)
 
 
 @app.route('/api/auth/forgot-password', methods=['POST'])
+@limiter.limit("3 per minute")
 def forgot_password():
     """Génère un code OTP pour la réinitialisation du mot de passe."""
     data = request.json
-    email = data.get('email', '').strip().lower()
-    
-    if not email or '@' not in email or '.' not in email:
-        return jsonify({'error': 'Adresse email invalide (ex: exemple@gmail.com)'}), 400
-    
+    if not data or not isinstance(data, dict):
+        return jsonify({'error': 'Corps JSON requis'}), 400
+
+    email = _str(data.get('email'), 150).lower()
+    if not _is_valid_email(email):
+        return jsonify({'error': 'Adresse email invalide'}), 400
+
+    if not SMTP_EMAIL or not SMTP_PASSWORD:
+        return jsonify({'error': 'Configuration SMTP manquante'}), 500
+
+    db = None
     try:
         db = get_db()
         with db.cursor() as cur:
-            # Vérifier si l'utilisateur existe
             cur.execute("SELECT id, name FROM users WHERE email = %s AND is_verified = 1", (email,))
             user = cur.fetchone()
-            
+
             if not user:
-                return jsonify({'error': 'Aucun compte trouvé avec cet email'}), 404
-            
-            # Générer et sauvegarder le code OTP
+                # Réponse générique pour éviter l'énumération d'emails
+                return jsonify({'message': 'Si cet email existe, un code vous a été envoyé'}), 200
+
+            user_name = user.get('name', '')
             otp = str(random.randint(100000, 999999))
             expires_at = datetime.now() + timedelta(minutes=15)
-            
-            # Supprimer anciens codes OTP pour cet email
+
             cur.execute("DELETE FROM otp_codes WHERE email = %s", (email,))
-            
-            # Insérer nouveau code OTP avec flag de réinitialisation
-            cur.execute("""
-                INSERT INTO otp_codes (email, code, name, expires_at)
-                VALUES (%s, %s, %s, %s)
-            """, (email, otp, user[1], expires_at))
-            
+            cur.execute(
+                "INSERT INTO otp_codes (email, code, name, expires_at) VALUES (%s, %s, %s, %s)",
+                (email, otp, user_name, expires_at)
+            )
             db.commit()
-            
-            # Envoyer l'email avec le code (utiliser la même fonction que register)
-            send_otp_email(email, user[1], otp, is_reset=True)
-            
-        db.close()
-        return jsonify({'message': f'Code de réinitialisation envoyé à {email}'}), 200
-        
+
+            try:
+                send_otp_email(email, user_name, otp, is_reset=True)
+            except Exception as email_error:
+                print(f"[ERROR] Email sending failed: {email_error}")
+
+            return jsonify({'message': 'Si cet email existe, un code vous a été envoyé'}), 200
+
+    except psycopg2.Error:
+        return jsonify({'error': 'Erreur base de données'}), 500
     except Exception as e:
-        print(f"[ForgotPassword] Error: {e}")
-        return jsonify({'error': 'Erreur lors de la génération du code'}), 500
+        print(f"[ERROR] ForgotPassword: {e}")
+        return jsonify({'error': 'Erreur technique'}), 500
+    finally:
+        if db:
+            _return_db(db)
 
 
 @app.route('/api/auth/reset-password', methods=['POST'])
 def reset_password():
     """Réinitialise le mot de passe avec le code OTP."""
     data = request.json
-    email = data.get('email', '').strip().lower()
-    code = data.get('code', '').strip()
-    new_password = data.get('newPassword', '').strip()
-    
-    if not email or '@' not in email:
+    if not data or not isinstance(data, dict):
+        return jsonify({'error': 'Corps JSON requis'}), 400
+
+    email        = _str(data.get('email'), 150).lower()
+    code         = _str(data.get('code'), 6)
+    new_password = data.get('newPassword') or data.get('new_password')
+
+    if not _is_valid_email(email):
         return jsonify({'error': 'Adresse email invalide'}), 400
-    
-    if not code or len(code) != 6:
+    if not code or not code.isdigit() or len(code) != 6:
         return jsonify({'error': 'Code de réinitialisation invalide'}), 400
+    pw_error = _check_password(new_password)
+    if pw_error:
+        return jsonify({'error': pw_error}), 400
+    new_password = str(new_password)
     
-    if not new_password or len(new_password) < 6:
-        return jsonify({'error': 'Le mot de passe doit contenir au moins 6 caractères'}), 400
-    
+    db = None
     try:
         db = get_db()
         with db.cursor() as cur:
-            # Vérifier le code OTP
             cur.execute("""
-                SELECT id FROM otp_codes 
+                SELECT id FROM otp_codes
                 WHERE email = %s AND code = %s AND expires_at > NOW()
             """, (email, code))
-            
-            otp_record = cur.fetchone()
-            if not otp_record:
+            if not cur.fetchone():
                 return jsonify({'error': 'Code invalide ou expiré'}), 400
-            
-            # Hasher le nouveau mot de passe
-            hashed_password = hashlib.sha256(new_password.encode()).hexdigest()
-            
-            # Mettre à jour le mot de passe
+
             cur.execute("""
-                UPDATE users SET password = %s 
+                UPDATE users SET password = %s
                 WHERE email = %s AND is_verified = 1
-            """, (hashed_password, email))
-            
-            # Supprimer le code OTP utilisé
+            """, (hash_password(new_password), email))
             cur.execute("DELETE FROM otp_codes WHERE email = %s", (email,))
-            
             db.commit()
-            
-        db.close()
+
         return jsonify({'message': 'Mot de passe réinitialisé avec succès'}), 200
-        
+
     except Exception as e:
         print(f"[ResetPassword] Error: {e}")
         return jsonify({'error': 'Erreur lors de la réinitialisation'}), 500
+    finally:
+        if db:
+            _return_db(db)
 
 
 @app.route('/api/auth/login', methods=['POST'])
+@limiter.limit("10 per minute")
 def login():
-    data     = request.json
-    email    = data.get('email', '').strip().lower()
-    password = data.get('password', '')
+    data = request.json
+    if not data or not isinstance(data, dict):
+        return jsonify({'error': 'Corps JSON requis'}), 400
 
-    if not email or not password:
-        return jsonify({'error': 'Email et mot de passe requis'}), 400
+    email    = _str(data.get('email'), 150).lower()
+    password = data.get('password')
+
+    # 400 for genuinely missing fields (form UX)
+    if not email:
+        return jsonify({'error': 'Email requis'}), 400
+    if not password or not isinstance(password, str) or not str(password).strip():
+        return jsonify({'error': 'Mot de passe requis'}), 400
+
+    # Invalid email format or oversized → generic 401 (no enumeration info)
+    if not _is_valid_email(email) or len(str(password)) > 128:
+        return jsonify({'error': 'Email ou mot de passe incorrect'}), 401
 
     db = get_db()
     try:
@@ -439,12 +566,24 @@ def login():
             cur.execute("SELECT * FROM users WHERE email = %s", (email,))
             user = cur.fetchone()
 
-        if not user or user['password'] != hash_password(password):
+        if not user or not verify_password(password, user['password']):
             return jsonify({'error': 'Email ou mot de passe incorrect'}), 401
 
-        return jsonify({'message': 'Connexion reussie', 'name': user['name'], 'email': email, 'role': user.get('role', 'user')}), 200
+        # Migration transparente : re-hasher les anciens comptes SHA256 vers bcrypt
+        if not (user['password'].startswith('$2b$') or user['password'].startswith('$2a$')):
+            new_hash = hash_password(password)
+            with db.cursor() as cur:
+                cur.execute("UPDATE users SET password = %s WHERE email = %s", (new_hash, email))
+            db.commit()
+
+        return jsonify({
+            'message': 'Connexion reussie',
+            'name': user['name'],
+            'email': email,
+            'role': user.get('role', 'user')
+        }), 200
     finally:
-        db.close()
+        _return_db(db)
 
 
 # ─── ADMIN ROUTES ─────────────────────────────────────────────────────────────
@@ -477,7 +616,7 @@ def admin_stats():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
-        db.close()
+        _return_db(db)
 
 
 @app.route('/api/admin/users', methods=['GET'])
@@ -502,7 +641,7 @@ def admin_get_users():
                 users.append(u)
         return jsonify(users), 200
     finally:
-        db.close()
+        _return_db(db)
 
 
 @app.route('/api/admin/users/<int:user_id>', methods=['PUT'])
@@ -519,7 +658,7 @@ def admin_update_user(user_id):
         db.commit()
         return jsonify({'message': 'Utilisateur mis a jour'}), 200
     finally:
-        db.close()
+        _return_db(db)
 
 
 @app.route('/api/admin/users/<int:user_id>', methods=['DELETE'])
@@ -531,7 +670,7 @@ def admin_delete_user(user_id):
         db.commit()
         return jsonify({'message': 'Utilisateur supprime'}), 200
     finally:
-        db.close()
+        _return_db(db)
 
 
 @app.route('/api/admin/users', methods=['POST'])
@@ -550,7 +689,7 @@ def admin_create_user():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
-        db.close()
+        _return_db(db)
 
 
 @app.route('/api/admin/payments', methods=['GET'])
@@ -575,7 +714,7 @@ def admin_get_payments():
     except:
         return jsonify([]), 200
     finally:
-        db.close()
+        _return_db(db)
 
 
 @app.route('/api/admin/payments', methods=['POST'])
@@ -594,7 +733,7 @@ def admin_create_payment():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
-        db.close()
+        _return_db(db)
 
 
 @app.route('/api/admin/payments/<int:pay_id>', methods=['DELETE'])
@@ -606,7 +745,7 @@ def admin_delete_payment(pay_id):
         db.commit()
         return jsonify({'message': 'Paiement supprime'}), 200
     finally:
-        db.close()
+        _return_db(db)
 
 
 # ─── GMAIL IMAP ───────────────────────────────────────────────────────────────
@@ -642,7 +781,7 @@ def gmail_status():
             user = cur.fetchone()
         return jsonify({'connected': bool(user and user.get('app_password'))})
     finally:
-        db.close()
+        _return_db(db)
 
 
 @app.route('/api/status')
@@ -655,21 +794,40 @@ def get_status():
     })
 
 
+# Cache des connexions IMAP : {email: (imap_conn, timestamp)}
+_imap_cache: dict = {}
+_IMAP_TTL = 60  # secondes
+
 def _get_imap_conn(email_addr):
-    """Retourne une connexion IMAP4_SSL pour l'utilisateur ou None."""
+    """
+    Retourne une connexion IMAP4_SSL pour l'utilisateur.
+    Réutilise la connexion si elle date de moins de 60s, sinon en crée une nouvelle.
+    """
+    cached = _imap_cache.get(email_addr)
+    if cached:
+        conn, ts = cached
+        if time.time() - ts < _IMAP_TTL:
+            try:
+                conn.noop()  # vérifie que la connexion est toujours vivante
+                return conn
+            except Exception:
+                _imap_cache.pop(email_addr, None)
+
     db = get_db()
     try:
         with db.cursor() as cur:
             cur.execute("SELECT app_password FROM users WHERE email = %s AND is_verified = 1", (email_addr,))
             row = cur.fetchone()
     finally:
-        db.close()
+        _return_db(db)
+
     if not row or not row.get('app_password'):
         return None
     passwd = row['app_password'].replace(' ', '').strip()
     try:
         mail = imaplib.IMAP4_SSL('imap.gmail.com', 993)
         mail.login(email_addr, passwd)
+        _imap_cache[email_addr] = (mail, time.time())
         return mail
     except Exception:
         return None
@@ -691,14 +849,26 @@ def get_emails():
     email = request.args.get('email', '').strip().lower()
     if not email:
         return jsonify([])
+
+    # Pagination : ?page=1&limit=20 (max 50 par page)
+    try:
+        page  = max(1, int(request.args.get('page', 1)))
+        limit = min(50, max(1, int(request.args.get('limit', 20))))
+    except (ValueError, TypeError):
+        page, limit = 1, 20
+
     try:
         mail = _get_imap_conn(email)
         if not mail:
             return jsonify([])
         mail.select('INBOX', readonly=True)
         _, data = mail.uid('search', None, 'ALL')
-        uids = data[0].split() if data[0] else []
-        uids = uids[-20:][::-1]
+        all_uids = data[0].split()[::-1] if data[0] else []  # plus récents en premier
+
+        total  = len(all_uids)
+        start  = (page - 1) * limit
+        uids   = all_uids[start:start + limit]
+
         emails = []
         for uid in uids:
             _, msg_data = mail.uid('fetch', uid, '(RFC822)')
@@ -717,11 +887,21 @@ def get_emails():
                 body = msg.get_payload(decode=True).decode('utf-8', errors='replace')[:150]
             _, flags_data = mail.uid('fetch', uid, '(FLAGS)')
             is_unread = b'\\Seen' not in (flags_data[0] or b'')
-            emails.append({"id": uid.decode(), "subject": subject, "sender": sender, "date": date, "snippet": body, "unread": is_unread})
-        mail.logout()
-        return jsonify(emails)
+            emails.append({
+                "id": uid.decode(), "subject": subject, "sender": sender,
+                "date": date, "snippet": body, "unread": is_unread
+            })
+
+        return jsonify({
+            "emails": emails,
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "pages": max(1, (total + limit - 1) // limit)
+        })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"[ERROR] get_emails: {e}")
+        return jsonify({"error": "Erreur lors de la récupération des emails"}), 500
 
 
 @app.route('/api/stats')
@@ -771,13 +951,13 @@ def get_whatsapp_qr():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
-        db.close()
+        _return_db(db)
 
 
 @app.route('/api/user/settings', methods=['GET'])
 def get_user_settings():
-    email = request.args.get('email')
-    if not email:
+    email = _str(request.args.get('email'), 150).lower()
+    if not _is_valid_email(email):
         return jsonify({"error": "email requis"}), 400
     db = get_db()
     try:
@@ -805,23 +985,23 @@ def get_user_settings():
         user['app_password_set'] = bool(user.pop('app_password', None))
         return jsonify(user)
     finally:
-        db.close()
+        _return_db(db)
 
 
 @app.route('/api/user/settings', methods=['PUT'])
 def update_user_settings():
     data = request.get_json() or {}
-    email = data.get('email')
-    if not email:
+    email = _str(data.get('email'), 150).lower()
+    if not _is_valid_email(email):
         return jsonify({"error": "email requis"}), 400
     db = get_db()
     try:
         with db.cursor() as cur:
-            app_password = data.get('app_password', '').replace(' ', '').strip() or None
-            avatar      = data.get('avatar', None)
-            name        = data.get('name', None)
-            theme_color = data.get('theme_color', None) or None
-            font_family = data.get('font_family', None) or None
+            app_password = (_str(data.get('app_password'), 200).replace(' ', '') or None)
+            avatar      = _str(data.get('avatar'), 65535) or None   # base64 image
+            name        = _str(data.get('name'), 100) or None
+            theme_color = _str(data.get('theme_color'), 20) or None
+            font_family = _str(data.get('font_family'), 60) or None
             if app_password:
                 cur.execute(
                     """UPDATE users SET
@@ -862,21 +1042,19 @@ def update_user_settings():
         db.commit()
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"[ERROR] update_user_settings: {e}")
+        return jsonify({"error": "Erreur lors de la mise à jour"}), 500
     finally:
-        db.close()
+        _return_db(db)
 
 
 # ─── EMAIL MONITOR ────────────────────────────────────────────────────────────
-
-import re as _re
-
 
 def _send_telegram_notification(chat_id, sender, subject, snippet, user_email):
     if not TELEGRAM_BOT_TOKEN:
         print("[Monitor] TELEGRAM_BOT_TOKEN manquant — notification ignoree")
         return
-    match = _re.match(r'^(.+?)\s*<', sender)
+    match = re.match(r'^(.+?)\s*<', sender)
     sender_name = match.group(1).strip().strip('"') if match else sender.split('@')[0]
     text = (
         f"\U0001f4e7 *Nouveau mail recu !*\n\n"
@@ -906,7 +1084,7 @@ def _save_last_uid(user_id, uid):
             cur.execute("UPDATE users SET last_history_id=%s WHERE id=%s", (str(uid), user_id))
         db.commit()
     finally:
-        db.close()
+        _return_db(db)
 
 
 def _check_user_emails_imap(user):
@@ -991,7 +1169,7 @@ def _check_all_users():
             """)
             users = [dict(u) for u in cur.fetchall()]
     finally:
-        db.close()
+        _return_db(db)
 
     if not users:
         return
@@ -1032,7 +1210,7 @@ def monitor_test():
             """)
             all_users = [dict(u) for u in cur.fetchall()]
     finally:
-        db.close()
+        _return_db(db)
 
     logs.append(f"Total utilisateurs: {len(all_users)}")
     for u in all_users:
@@ -1070,6 +1248,9 @@ def monitor_test():
 # ─── STARTUP (fonctionne avec gunicorn ET python api.py) ─────────────────────
 
 def _startup():
+    # Skip startup in test environment (avoids real DB connections and daemon threads)
+    if os.getenv('TESTING'):
+        return
     print("[STARTUP] Debut de l'initialisation...")
     try:
         init_db()
