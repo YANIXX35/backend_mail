@@ -15,8 +15,11 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import decode_header as _decode_header
 from datetime import datetime, timedelta
-from flask import Flask, jsonify, request, redirect
+from flask import Flask, jsonify, request, redirect, render_template
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from dotenv import load_dotenv
 import psycopg2
 import psycopg2.extras
@@ -29,6 +32,9 @@ load_dotenv()
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB max request body
+
+# Initialiser SocketIO pour WebSocket
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # CORS restreint aux origines connues
 ALLOWED_ORIGINS = [
@@ -1276,6 +1282,117 @@ def monitor_test():
 
 @app.route('/api/dashboard/advanced-stats', methods=['GET'])
 @limiter.limit("20 per minute")
+@app.route('/api/preferences', methods=['GET'])
+@limiter.limit("20 per minute")
+def get_preferences():
+    """Récupérer les préférences utilisateur."""
+    user_id = request.args.get('user_id')
+    
+    if not user_id:
+        return jsonify({'error': 'user_id requis'}), 400
+    
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            cur.execute("""
+                SELECT preference_key, preference_value, updated_at
+                FROM user_preferences 
+                WHERE user_id = %s
+            """, (user_id,))
+            
+            preferences = cur.fetchall()
+            
+        return jsonify({
+            'preferences': [
+                {
+                    'key': row['preference_key'],
+                    'value': row['preference_value'],
+                    'updated_at': str(row['updated_at'])
+                } for row in preferences
+            ]
+        }), 200
+        
+    except Exception as e:
+        print(f"[ERROR] Get preferences: {e}")
+        return jsonify({'error': 'Erreur lors de la récupération des préférences'}), 500
+        
+    finally:
+        if 'db' in locals():
+            db.close()
+
+@app.route('/api/preferences', methods=['POST'])
+@limiter.limit("20 per minute")
+def update_preferences():
+    """Mettre à jour les préférences utilisateur."""
+    data = request.json
+    if not data or not isinstance(data, dict):
+        return jsonify({'error': 'Données invalides'}), 400
+    
+    user_id = data.get('user_id')
+    preferences = data.get('preferences', {})
+    
+    if not user_id or not preferences:
+        return jsonify({'error': 'user_id et preferences requis'}), 400
+    
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            # Supprimer les anciennes préférences
+            cur.execute("DELETE FROM user_preferences WHERE user_id = %s", (user_id,))
+            
+            # Insérer les nouvelles préférences
+            for key, value in preferences.items():
+                cur.execute("""
+                    INSERT INTO user_preferences (user_id, preference_key, preference_value)
+                    VALUES (%s, %s, %s)
+                """, (user_id, key, value))
+            
+            db.commit()
+            
+        # Notifier WebSocket pour temps réel
+        emit('preference_updated', {
+            'user_id': user_id,
+            'preferences': preferences
+        }, room=f"user_{user_id}")
+        
+        print(f"[PREFERENCES] Préférences mises à jour pour user {user_id}")
+
+@socketio.on('connect')
+def handle_connect():
+    """Gère la connexion WebSocket."""
+    user_id = request.args.get('user_id')
+    if user_id:
+        join_room(f"user_{user_id}")
+        print(f"[WEBSOCKET] User {user_id} connecté")
+        emit('connected', {'message': f'Connecté avec succès pour user {user_id}'})
+    else:
+        print(f"[WEBSOCKET] Connexion sans user_id")
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Gère la déconnexion WebSocket."""
+    print(f"[WEBSOCKET] Utilisateur déconnecté")
+
+@socketio.on('join_user_room')
+def handle_join_user_room(data):
+    """Rejoint la room utilisateur spécifique."""
+    user_id = data.get('user_id')
+    if user_id:
+        join_room(f"user_{user_id}")
+        emit('joined_room', {'room': f"user_{user_id}"})
+        
+        return jsonify({'message': 'Préférences mises à jour avec succès'}), 200
+        
+    except Exception as e:
+        print(f"[ERROR] Update preferences: {e}")
+        return jsonify({'error': 'Erreur lors de la mise à jour des préférences'}), 500
+        
+    finally:
+        if 'db' in locals():
+            db.close()
+
+@app.route('/api/dashboard/advanced-stats', methods=['GET'])
+@limiter.limit("20 per minute")
 def get_advanced_stats():
     """Endpoint pour récupérer les statistiques avancées du tableau de bord."""
     email = request.args.get('email')
@@ -1381,6 +1498,29 @@ def get_advanced_stats():
             db.close()
 
 
+def init_user_preferences():
+    """Initialise la table user_preferences pour la synchronisation."""
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_preferences (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    preference_key VARCHAR(100) NOT NULL,
+                    preference_value TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, preference_key)
+                )
+            """)
+            db.commit()
+            print("[DB] Table user_preferences créée avec succès")
+    except Exception as e:
+        print(f"[ERROR] Erreur création table user_preferences: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
 def _startup():
     # Skip startup in test environment (avoids real DB connections and daemon threads)
     if os.getenv('TESTING'):
@@ -1388,6 +1528,7 @@ def _startup():
     print("[STARTUP] Debut de l'initialisation...")
     try:
         init_db()
+        init_user_preferences()  # Initialiser la table des préférences
         notifier_status["running"] = True
         print("[STARTUP] Lancement thread TelegramBot...")
         threading.Thread(target=telegram_bot_polling, daemon=True, name="tg-bot").start()
