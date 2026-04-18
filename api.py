@@ -33,10 +33,11 @@ app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB max request body
 # CORS restreint aux origines connues
 ALLOWED_ORIGINS = [
     "https://yanixx35.github.io",
+    "https://bs-mailnotif-nine.vercel.app",
     "http://localhost:4200",
     "http://localhost:4201",
 ]
-CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=False)
+CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
 
 # Rate limiting (mémoire locale — réinitialisé au redémarrage)
 # Désactivé en environnement de test (TESTING=1) pour éviter les conflits avec threading mocks
@@ -51,10 +52,21 @@ limiter = Limiter(
 @app.after_request
 def add_security_headers(response):
     origin = request.headers.get('Origin', '')
+    
+    # CORS : Autoriser explicitement l'origin Vercel
     if origin in ALLOWED_ORIGINS:
         response.headers['Access-Control-Allow-Origin'] = origin
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Cache-Control, Pragma'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+    else:
+        # Pour le développement, autoriser toutes les origins (à commenter en prod)
+        response.headers['Access-Control-Allow-Origin'] = '*'
+    
+    # Headers CORS complets
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Cache-Control, Pragma, X-Requested-With'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS, PATCH'
+    response.headers['Access-Control-Max-Age'] = '86400'  # 24 heures
+    
+    # Headers de sécurité
     response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
     response.headers['Pragma'] = 'no-cache'
     response.headers['X-Content-Type-Options'] = 'nosniff'
@@ -63,7 +75,19 @@ def add_security_headers(response):
 
 @app.route('/api/<path:path>', methods=['OPTIONS'])
 def handle_options(path):
-    return '', 200
+    """Gère les requêtes preflight OPTIONS avec tous les headers CORS nécessaires"""
+    response = ''
+    # Si c'est une requête preflight, renvoyer les headers CORS
+    if request.method == 'OPTIONS':
+        origin = request.headers.get('Origin', '')
+        if origin in ALLOWED_ORIGINS:
+            response = jsonify({'status': 'preflight'})
+            response.headers['Access-Control-Allow-Origin'] = origin
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Cache-Control, Pragma, X-Requested-With'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS, PATCH'
+        response.headers['Access-Control-Max-Age'] = '86400'
+    return response, 200
 
 SMTP_EMAIL        = os.getenv('SMTP_EMAIL')
 SMTP_PASSWORD     = os.getenv('SMTP_PASSWORD')
