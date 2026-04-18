@@ -27,6 +27,8 @@ import psycopg2.pool
 import bcrypt
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+import jwt
+from functools import wraps
 
 load_dotenv()
 
@@ -98,8 +100,68 @@ def handle_options(path):
 SMTP_EMAIL        = os.getenv('SMTP_EMAIL')
 SMTP_PASSWORD     = os.getenv('SMTP_PASSWORD')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+JWT_SECRET_KEY    = os.getenv('JWT_SECRET_KEY', 'your-secret-key-change-in-production')
+JWT_ALGORITHM     = 'HS256'
 
 notifier_status = {"running": False}
+
+# Middleware JWT pour sécuriser les endpoints
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        
+        # Vérifier le token dans le header Authorization
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            if auth_header.startswith('Bearer '):
+                token = auth_header.split(' ')[1]
+        
+        if not token:
+            return jsonify({'error': 'Token JWT requis'}), 401
+        
+        try:
+            # Décoder le token
+            payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+            user_id = payload['user_id']
+            user_email = payload['email']
+            
+            # Vérifier que l'utilisateur existe
+            db = get_db()
+            with db.cursor() as cur:
+                cur.execute("SELECT id, email FROM users WHERE id = %s AND email = %s", (user_id, user_email))
+                user = cur.fetchone()
+                
+            if not user:
+                return jsonify({'error': 'Utilisateur non trouvé'}), 401
+                
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'Token expiré'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'error': 'Token invalide'}), 401
+        except Exception as e:
+            print(f"[JWT ERROR] {e}")
+            return jsonify({'error': 'Erreur de validation du token'}), 401
+        finally:
+            if 'db' in locals():
+                db.close()
+        
+        # Ajouter les infos utilisateur à la request
+        request.current_user = {'id': user_id, 'email': user_email}
+        
+        return f(*args, **kwargs)
+    
+    return decorated
+
+def generate_token(user_id: int, email: str) -> str:
+    """Génère un token JWT pour l'utilisateur."""
+    payload = {
+        'user_id': user_id,
+        'email': email,
+        'exp': datetime.utcnow() + timedelta(hours=24),  # Expire dans 24h
+        'iat': datetime.utcnow()
+    }
+    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
 
 # ─── TELEGRAM BOT POLLING ─────────────────────────────────────────────────────
@@ -1279,25 +1341,22 @@ def monitor_test():
 
 
 # ─── STARTUP (fonctionne avec gunicorn ET python api.py) ─────────────────────
-
-@app.route('/api/dashboard/advanced-stats', methods=['GET'])
 @limiter.limit("20 per minute")
 @app.route('/api/preferences', methods=['GET'])
 @limiter.limit("20 per minute")
+@token_required
 def get_preferences():
-    """Récupérer les préférences utilisateur."""
-    user_id = request.args.get('user_id')
-    
-    if not user_id:
-        return jsonify({'error': 'user_id requis'}), 400
+    """Récupérer les préférences utilisateur (sécurisé avec JWT)."""
+    user_id = request.current_user['id']
     
     try:
         db = get_db()
         with db.cursor() as cur:
             cur.execute("""
-                SELECT preference_key, preference_value, updated_at
+                SELECT preference_key, preference_value, updated_at, version
                 FROM user_preferences 
                 WHERE user_id = %s
+                ORDER BY updated_at DESC
             """, (user_id,))
             
             preferences = cur.fetchall()
@@ -1307,9 +1366,11 @@ def get_preferences():
                 {
                     'key': row['preference_key'],
                     'value': row['preference_value'],
-                    'updated_at': str(row['updated_at'])
+                    'updated_at': str(row['updated_at']),
+                    'version': row['version']
                 } for row in preferences
-            ]
+            ],
+            'user_id': user_id
         }), 200
         
     except Exception as e:
@@ -1322,66 +1383,86 @@ def get_preferences():
 
 @app.route('/api/preferences', methods=['POST'])
 @limiter.limit("20 per minute")
+@token_required
 def update_preferences():
-    """Mettre à jour les préférences utilisateur."""
+    """Mettre à jour les préférences utilisateur (sécurisé avec JWT + gestion conflits)."""
     data = request.json
     if not data or not isinstance(data, dict):
         return jsonify({'error': 'Données invalides'}), 400
     
-    user_id = data.get('user_id')
     preferences = data.get('preferences', {})
+    client_version = data.get('version', 0)
     
-    if not user_id or not preferences:
-        return jsonify({'error': 'user_id et preferences requis'}), 400
+    if not preferences:
+        return jsonify({'error': 'preferences requis'}), 400
+    
+    user_id = request.current_user['id']
     
     try:
         db = get_db()
         with db.cursor() as cur:
-            # Supprimer les anciennes préférences
-            cur.execute("DELETE FROM user_preferences WHERE user_id = %s", (user_id,))
+            # Vérifier la version actuelle pour gestion des conflits
+            cur.execute("""
+                SELECT MAX(version) as current_version
+                FROM user_preferences 
+                WHERE user_id = %s
+            """, (user_id,))
             
-            # Insérer les nouvelles préférences
+            result = cur.fetchone()
+            current_version = result['current_version'] or 0
+            
+            # Gestion des conflits : si la version client est plus ancienne, retourner conflit
+            if client_version > 0 and client_version < current_version:
+                # Récupérer les préférences actuelles
+                cur.execute("""
+                    SELECT preference_key, preference_value, version
+                    FROM user_preferences 
+                    WHERE user_id = %s AND version = %s
+                """, (user_id, current_version))
+                
+                current_prefs = cur.fetchall()
+                
+                return jsonify({
+                    'error': 'CONFLICT',
+                    'message': 'Vos préférences ont été modifiées sur un autre appareil',
+                    'current_preferences': {
+                        pref['preference_key']: pref['preference_value'] 
+                        for pref in current_prefs
+                    },
+                    'current_version': current_version
+                }), 409
+            
+            # Nouvelle version pour cette mise à jour
+            new_version = current_version + 1
+            
+            # Insérer les nouvelles préférences avec version
             for key, value in preferences.items():
                 cur.execute("""
-                    INSERT INTO user_preferences (user_id, preference_key, preference_value)
-                    VALUES (%s, %s, %s)
-                """, (user_id, key, value))
+                    INSERT INTO user_preferences (user_id, preference_key, preference_value, version)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (user_id, preference_key) 
+                    DO UPDATE SET 
+                        preference_value = EXCLUDED.preference_value,
+                        version = EXCLUDED.version,
+                        updated_at = CURRENT_TIMESTAMP
+                """, (user_id, key, value, new_version))
             
             db.commit()
             
         # Notifier WebSocket pour temps réel
-        emit('preference_updated', {
+        socketio.emit('preference_updated', {
             'user_id': user_id,
-            'preferences': preferences
+            'preferences': preferences,
+            'version': new_version,
+            'updated_at': datetime.utcnow().isoformat()
         }, room=f"user_{user_id}")
         
-        print(f"[PREFERENCES] Préférences mises à jour pour user {user_id}")
-
-@socketio.on('connect')
-def handle_connect():
-    """Gère la connexion WebSocket."""
-    user_id = request.args.get('user_id')
-    if user_id:
-        join_room(f"user_{user_id}")
-        print(f"[WEBSOCKET] User {user_id} connecté")
-        emit('connected', {'message': f'Connecté avec succès pour user {user_id}'})
-    else:
-        print(f"[WEBSOCKET] Connexion sans user_id")
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    """Gère la déconnexion WebSocket."""
-    print(f"[WEBSOCKET] Utilisateur déconnecté")
-
-@socketio.on('join_user_room')
-def handle_join_user_room(data):
-    """Rejoint la room utilisateur spécifique."""
-    user_id = data.get('user_id')
-    if user_id:
-        join_room(f"user_{user_id}")
-        emit('joined_room', {'room': f"user_{user_id}"})
+        print(f"[PREFERENCES] Préférences mises à jour pour user {user_id} (version {new_version})")
         
-        return jsonify({'message': 'Préférences mises à jour avec succès'}), 200
+        return jsonify({
+            'message': 'Préférences mises à jour avec succès',
+            'version': new_version
+        }), 200
         
     except Exception as e:
         print(f"[ERROR] Update preferences: {e}")
@@ -1390,6 +1471,146 @@ def handle_join_user_room(data):
     finally:
         if 'db' in locals():
             db.close()
+
+@app.route('/api/auth/token', methods=['POST'])
+@limiter.limit("10 per minute")
+def get_auth_token():
+    """Génère un token JWT pour l'utilisateur authentifié."""
+    email = request.json.get('email')
+    password = request.json.get('password')
+    
+    if not email or not password:
+        return jsonify({'error': 'Email et mot de passe requis'}), 400
+    
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            cur.execute("SELECT id, email, password FROM users WHERE email = %s", (email,))
+            user = cur.fetchone()
+            
+            if not user or not bcrypt.checkpw(password.encode('utf-8'), user['password'].encode('utf-8')):
+                return jsonify({'error': 'Email ou mot de passe incorrect'}), 401
+            
+            # Générer le token JWT
+            token = generate_token(user['id'], user['email'])
+            
+            return jsonify({
+                'token': token,
+                'user_id': user['id'],
+                'email': user['email'],
+                'expires_in': 24 * 3600  # 24 heures en secondes
+            }), 200
+            
+    except Exception as e:
+        print(f"[ERROR] Auth token: {e}")
+        return jsonify({'error': 'Erreur lors de l\'authentification'}), 500
+        
+    finally:
+        if 'db' in locals():
+            db.close()
+
+@socketio.on('connect')
+def handle_connect():
+    """Gère la connexion WebSocket avec authentification JWT."""
+    token = request.args.get('token')
+    user_id = None
+    
+    if token:
+        try:
+            # Valider le token JWT
+            payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+            user_id = payload['user_id']
+            
+            # Vérifier que l'utilisateur existe
+            db = get_db()
+            with db.cursor() as cur:
+                cur.execute("SELECT id, email FROM users WHERE id = %s", (user_id,))
+                user = cur.fetchone()
+                
+            if user:
+                join_room(f"user_{user_id}")
+                print(f"[WEBSOCKET] User {user_id} connecté avec succès")
+                emit('connected', {
+                    'message': f'Connecté avec succès pour user {user_id}',
+                    'user_id': user_id,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+            else:
+                print(f"[WEBSOCKET] Token valide mais utilisateur {user_id} non trouvé")
+                emit('error', {'message': 'Utilisateur non trouvé'})
+                return False
+                
+        except jwt.ExpiredSignatureError:
+            print(f"[WEBSOCKET] Token expiré")
+            emit('error', {'message': 'Token expiré'})
+            return False
+        except jwt.InvalidTokenError:
+            print(f"[WEBSOCKET] Token invalide")
+            emit('error', {'message': 'Token invalide'})
+            return False
+        except Exception as e:
+            print(f"[WEBSOCKET] Erreur validation token: {e}")
+            emit('error', {'message': 'Erreur d\'authentification'})
+            return False
+        finally:
+            if 'db' in locals():
+                db.close()
+    else:
+        print(f"[WEBSOCKET] Connexion sans token")
+        emit('error', {'message': 'Token requis'})
+        return False
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Gère la déconnexion WebSocket."""
+    print(f"[WEBSOCKET] Utilisateur déconnecté")
+
+@socketio.on('ping')
+def handle_ping():
+    """Gère le ping pour keep-alive."""
+    emit('pong', {'timestamp': datetime.utcnow().isoformat()})
+
+@socketio.on('join_user_room')
+def handle_join_user_room(data):
+    """Rejoint la room utilisateur spécifique avec validation."""
+    user_id = data.get('user_id')
+    token = data.get('token')
+    
+    if not token:
+        emit('error', {'message': 'Token requis'})
+        return
+    
+    try:
+        # Valider le token
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        token_user_id = payload['user_id']
+        
+        if str(token_user_id) != str(user_id):
+            emit('error', {'message': 'Token invalide pour cet utilisateur'})
+            return
+        
+        join_room(f"user_{user_id}")
+        emit('joined_room', {
+            'room': f"user_{user_id}",
+            'timestamp': datetime.utcnow().isoformat()
+        })
+        
+        print(f"[WEBSOCKET] User {user_id} a rejoint sa room")
+        
+    except jwt.InvalidTokenError:
+        emit('error', {'message': 'Token invalide'})
+    except Exception as e:
+        print(f"[WEBSOCKET] Erreur join room: {e}")
+        emit('error', {'message': 'Erreur lors de la jonction de la room'})
+
+# Système de ping/pong automatique pour maintenir les connexions
+@socketio.on('keep_alive')
+def handle_keep_alive():
+    """Répond au keep-alive pour maintenir la connexion."""
+    emit('keep_alive_response', {
+        'timestamp': datetime.utcnow().isoformat(),
+        'status': 'alive'
+    })
 
 @app.route('/api/dashboard/advanced-stats', methods=['GET'])
 @limiter.limit("20 per minute")
@@ -1509,12 +1730,20 @@ def init_user_preferences():
                     user_id INTEGER NOT NULL REFERENCES users(id),
                     preference_key VARCHAR(100) NOT NULL,
                     preference_value TEXT,
+                    version INTEGER DEFAULT 1,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(user_id, preference_key)
                 )
             """)
+            
+            # Ajouter le champ version s'il n'existe pas
+            cur.execute("""
+                ALTER TABLE user_preferences 
+                ADD COLUMN IF NOT EXISTS version INTEGER DEFAULT 1
+            """)
+            
             db.commit()
-            print("[DB] Table user_preferences créée avec succès")
+            print("[DB] Table user_preferences créée/mise à jour avec succès")
     except Exception as e:
         print(f"[ERROR] Erreur création table user_preferences: {e}")
         db.rollback()
