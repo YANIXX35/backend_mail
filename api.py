@@ -566,7 +566,10 @@ def login():
             cur.execute("SELECT * FROM users WHERE email = %s", (email,))
             user = cur.fetchone()
 
-        if not user or not verify_password(password, user['password']):
+        if not user:
+            return jsonify({'error': 'Email ou mot de passe incorrect'}), 401
+        
+        if not verify_password(password, user['password']):
             return jsonify({'error': 'Email ou mot de passe incorrect'}), 401
 
         # Migration transparente : re-hasher les anciens comptes SHA256 vers bcrypt
