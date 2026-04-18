@@ -25,8 +25,6 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 import bcrypt
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 import jwt
 from functools import wraps
 
@@ -34,9 +32,6 @@ load_dotenv()
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB max request body
-
-# Initialiser SocketIO pour WebSocket
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # CORS restreint aux origines connues
 ALLOWED_ORIGINS = [
@@ -46,6 +41,9 @@ ALLOWED_ORIGINS = [
     "http://localhost:4201",
 ]
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
+
+# Initialiser SocketIO pour WebSocket avec les mêmes origines que CORS
+socketio = SocketIO(app, cors_allowed_origins=ALLOWED_ORIGINS, async_mode='threading')
 
 # Rate limiting (mémoire locale — réinitialisé au redémarrage)
 # Désactivé en environnement de test (TESTING=1) pour éviter les conflits avec threading mocks
