@@ -33,10 +33,11 @@ app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB max request body
 # CORS restreint aux origines connues
 ALLOWED_ORIGINS = [
     "https://yanixx35.github.io",
+    "https://bs-mailnotif-nine.vercel.app",
     "http://localhost:4200",
     "http://localhost:4201",
 ]
-CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=False)
+CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
 
 # Rate limiting (mémoire locale — réinitialisé au redémarrage)
 # Désactivé en environnement de test (TESTING=1) pour éviter les conflits avec threading mocks
@@ -51,10 +52,21 @@ limiter = Limiter(
 @app.after_request
 def add_security_headers(response):
     origin = request.headers.get('Origin', '')
+    
+    # CORS : Autoriser explicitement l'origin Vercel
     if origin in ALLOWED_ORIGINS:
         response.headers['Access-Control-Allow-Origin'] = origin
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Cache-Control, Pragma'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+    else:
+        # Pour le développement, autoriser toutes les origins (à commenter en prod)
+        response.headers['Access-Control-Allow-Origin'] = '*'
+    
+    # Headers CORS complets
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Cache-Control, Pragma, X-Requested-With'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS, PATCH'
+    response.headers['Access-Control-Max-Age'] = '86400'  # 24 heures
+    
+    # Headers de sécurité
     response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
     response.headers['Pragma'] = 'no-cache'
     response.headers['X-Content-Type-Options'] = 'nosniff'
@@ -63,7 +75,19 @@ def add_security_headers(response):
 
 @app.route('/api/<path:path>', methods=['OPTIONS'])
 def handle_options(path):
-    return '', 200
+    """Gère les requêtes preflight OPTIONS avec tous les headers CORS nécessaires"""
+    response = ''
+    # Si c'est une requête preflight, renvoyer les headers CORS
+    if request.method == 'OPTIONS':
+        origin = request.headers.get('Origin', '')
+        if origin in ALLOWED_ORIGINS:
+            response = jsonify({'status': 'preflight'})
+            response.headers['Access-Control-Allow-Origin'] = origin
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Cache-Control, Pragma, X-Requested-With'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS, PATCH'
+        response.headers['Access-Control-Max-Age'] = '86400'
+    return response, 200
 
 SMTP_EMAIL        = os.getenv('SMTP_EMAIL')
 SMTP_PASSWORD     = os.getenv('SMTP_PASSWORD')
@@ -566,7 +590,10 @@ def login():
             cur.execute("SELECT * FROM users WHERE email = %s", (email,))
             user = cur.fetchone()
 
-        if not user or not verify_password(password, user['password']):
+        if not user:
+            return jsonify({'error': 'Email ou mot de passe incorrect'}), 401
+        
+        if not verify_password(password, user['password']):
             return jsonify({'error': 'Email ou mot de passe incorrect'}), 401
 
         # Migration transparente : re-hasher les anciens comptes SHA256 vers bcrypt
@@ -1246,6 +1273,113 @@ def monitor_test():
 
 
 # ─── STARTUP (fonctionne avec gunicorn ET python api.py) ─────────────────────
+
+@app.route('/api/dashboard/advanced-stats', methods=['GET'])
+@limiter.limit("20 per minute")
+def get_advanced_stats():
+    """Endpoint pour récupérer les statistiques avancées du tableau de bord."""
+    email = request.args.get('email')
+    period = int(request.args.get('period', 30))  # jours
+    status = request.args.get('status', 'all')
+    sender_filter = request.args.get('sender', '')
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    
+    if not email:
+        return jsonify({'error': 'Email requis'}), 400
+    
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            # Statistiques générales
+            cur.execute("""
+                SELECT 
+                    COUNT(*) as total_emails,
+                    SUM(CASE WHEN is_read = false THEN 1 ELSE 0 END) as unread_emails,
+                    SUM(CASE WHEN is_sent = true THEN 1 ELSE 0 END) as sent_emails,
+                    DATE(sent_at) as last_email_date
+                FROM emails 
+                WHERE user_email = %s
+            """, (email,))
+            
+            stats = cur.fetchone()
+            
+            # Évolution temporelle
+            cur.execute("""
+                SELECT 
+                    DATE(sent_at) as date,
+                    COUNT(*) as count,
+                    SUM(CASE WHEN is_read = false THEN 1 ELSE 0 END) as unread
+                FROM emails 
+                WHERE user_email = %s 
+                    AND sent_at >= CURRENT_DATE - INTERVAL '%s days'
+                GROUP BY DATE(sent_at)
+                ORDER BY date DESC
+            """, (email, period))
+            
+            evolution = cur.fetchall()
+            
+            # Répartition par statut
+            cur.execute("""
+                SELECT 
+                    CASE WHEN is_read = true THEN 'Lus' ELSE 'Non lus' END as status,
+                    COUNT(*) as count
+                FROM emails 
+                WHERE user_email = %s
+                GROUP BY is_read
+            """, (email,))
+            
+            status_distribution = cur.fetchall()
+            
+            # Top expéditeurs
+            cur.execute("""
+                SELECT 
+                    sender,
+                    COUNT(*) as count
+                FROM emails 
+                WHERE user_email = %s
+                    AND sender IS NOT NULL
+                GROUP BY sender
+                ORDER BY count DESC
+                LIMIT 10
+            """, (email,))
+            
+            top_senders = cur.fetchall()
+            
+        return jsonify({
+            'total_emails': int(stats['total_emails'] or 0),
+            'unread_emails': int(stats['unread_emails'] or 0),
+            'sent_emails': int(stats['sent_emails'] or 0),
+            'average_per_day': round(int(stats['total_emails'] or 0) / period, 1),
+            'evolution': [
+                {
+                    'date': str(row['date']),
+                    'count': int(row['count']),
+                    'unread': int(row['unread'])
+                } for row in evolution
+            ],
+            'status_distribution': [
+                {
+                    'status': row['status'],
+                    'count': int(row['count'])
+                } for row in status_distribution
+            ],
+            'top_senders': [
+                {
+                    'sender': row['sender'],
+                    'count': int(row['count'])
+                } for row in top_senders
+            ]
+        }), 200
+        
+    except Exception as e:
+        print(f"[ERROR] Advanced stats: {e}")
+        return jsonify({'error': 'Erreur lors de la récupération des statistiques'}), 500
+        
+    finally:
+        if 'db' in locals():
+            db.close()
+
 
 def _startup():
     # Skip startup in test environment (avoids real DB connections and daemon threads)
