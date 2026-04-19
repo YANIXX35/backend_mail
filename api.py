@@ -1452,11 +1452,14 @@ def _send_telegram_notification(chat_id, sender, subject, snippet, user_email):
     match = re.match(r'^(.+?)\s*<', sender)
     sender_name = match.group(1).strip().strip('"') if match else sender.split('@')[0]
     text = (
-        f"\U0001f4e7 *Nouveau mail recu !*\n\n"
-        f"*De :* {sender_name}\n"
-        f"*Objet :* {subject}\n"
-        f"*Apercu :* {snippet}\n\n"
-        f"_Compte : {user_email}_"
+        f"📬 *MailNotifier*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Vous avez reçu un nouveau mail !\n\n"
+        f"👤 *De :* {sender_name}\n"
+        f"📌 *Objet :* {subject}\n"
+        f"💬 *Aperçu :*\n_{snippet[:200]}_\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🔔 Consultez votre boîte mail pour plus de détails."
     )
     try:
         resp = requests.post(
