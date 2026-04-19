@@ -276,6 +276,9 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS theme_color VARCHAR(20)")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS font_family VARCHAR(60)")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS theme_mode       VARCHAR(10) DEFAULT 'light'")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS theme_secondary  VARCHAR(20)")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS theme_updated_at TIMESTAMP DEFAULT NOW()")
             # Promouvoir l'admin principal
             cur.execute("UPDATE users SET role='admin' WHERE email='kyliyanisse@gmail.com'")
             cur.execute("""
@@ -851,13 +854,22 @@ def test_gmail_imap():
     passwd = data.get('app_password', '').replace(' ', '').strip()
     if not gmail or not passwd:
         return jsonify({'success': False, 'error': 'Adresse Gmail et mot de passe requis'}), 400
+    if len(passwd) != 16:
+        return jsonify({'success': False, 'error': f'Le code doit faire 16 caractères (reçu : {len(passwd)})'}), 400
     try:
         mail = imaplib.IMAP4_SSL('imap.gmail.com', 993)
         mail.login(gmail, passwd)
         mail.logout()
         return jsonify({'success': True})
-    except imaplib.IMAP4.error:
-        return jsonify({'success': False, 'error': 'Code incorrect ou IMAP desactive'}), 401
+    except imaplib.IMAP4.error as e:
+        msg = str(e).lower()
+        if 'webalert' in msg or 'web login' in msg or 'imap access' in msg:
+            error = "IMAP désactivé — active-le dans les paramètres Gmail (Paramètres > Voir tous > POP/IMAP)"
+        elif 'invalid credentials' in msg or 'authenticationfailed' in msg:
+            error = "Mot de passe d'application incorrect — génère un nouveau code sur myaccount.google.com/apppasswords"
+        else:
+            error = "Connexion refusée — vérifie que la validation en 2 étapes est activée et que le code est valide"
+        return jsonify({'success': False, 'error': error}), 401
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -1057,7 +1069,8 @@ def get_user_settings():
         with db.cursor() as cur:
             cur.execute(
                 "SELECT name, email, phone, gmail_address, telegram_chat_id, green_api_instance, "
-                "green_api_token, app_password, avatar, theme_color, font_family "
+                "green_api_token, app_password, avatar, theme_color, font_family, theme_mode, theme_secondary, "
+                "to_char(theme_updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS theme_updated_at "
                 "FROM users WHERE email = %s AND is_verified = 1",
                 (email,)
             )
@@ -1068,14 +1081,18 @@ def get_user_settings():
                 "gmail_address": "", "telegram_chat_id": "",
                 "green_api_instance": "", "green_api_token": "",
                 "app_password_set": False, "avatar": "",
-                "theme_color": "", "font_family": ""
+                "theme_color": "", "font_family": "", "theme_mode": "light",
+                "theme_secondary": "", "theme_updated_at": None
             })
         user = dict(user)
         for key in ["phone", "gmail_address", "telegram_chat_id", "green_api_instance",
-                    "green_api_token", "avatar", "theme_color", "font_family"]:
+                    "green_api_token", "avatar", "theme_color", "font_family",
+                    "theme_mode", "theme_secondary"]:  # theme_updated_at is a timestamp, handled separately
             if user.get(key) is None:
                 user[key] = ""
         user['app_password_set'] = bool(user.pop('app_password', None))
+        if not user.get('theme_mode'):
+            user['theme_mode'] = 'light'
         return jsonify(user)
     finally:
         _return_db(db)
@@ -1093,8 +1110,12 @@ def update_user_settings():
             app_password = (_str(data.get('app_password'), 200).replace(' ', '') or None)
             avatar      = _str(data.get('avatar'), 65535) or None   # base64 image
             name        = _str(data.get('name'), 100) or None
-            theme_color = _str(data.get('theme_color'), 20) or None
-            font_family = _str(data.get('font_family'), 60) or None
+            theme_color     = _str(data.get('theme_color'),     20) or None
+            font_family     = _str(data.get('font_family'),     60) or None
+            theme_mode      = _str(data.get('theme_mode'),      10) or None
+            theme_secondary = _str(data.get('theme_secondary'), 20) or None
+            if theme_mode and theme_mode not in ('light', 'dark'):
+                theme_mode = None
             if app_password:
                 cur.execute(
                     """UPDATE users SET
@@ -1106,13 +1127,18 @@ def update_user_settings():
                         green_api_token = %s,
                         app_password = %s,
                         avatar = COALESCE(%s, avatar),
-                        theme_color = COALESCE(%s, theme_color),
-                        font_family = COALESCE(%s, font_family)
+                        theme_color      = COALESCE(%s, theme_color),
+                        font_family      = COALESCE(%s, font_family),
+                        theme_mode       = COALESCE(%s, theme_mode),
+                        theme_secondary  = COALESCE(%s, theme_secondary),
+                        theme_updated_at = CASE WHEN %s THEN NOW() ELSE theme_updated_at END
                     WHERE email = %s AND is_verified = 1""",
                     (name, data.get('phone'), data.get('gmail_address'),
                      data.get('telegram_chat_id'), data.get('green_api_instance'),
                      data.get('green_api_token'), app_password,
-                     avatar, theme_color, font_family, email)
+                     avatar, theme_color, font_family, theme_mode, theme_secondary,
+                     bool(theme_color or font_family or theme_mode or theme_secondary),
+                     email)
                 )
             else:
                 cur.execute(
@@ -1123,14 +1149,19 @@ def update_user_settings():
                         telegram_chat_id = %s,
                         green_api_instance = %s,
                         green_api_token = %s,
-                        avatar = COALESCE(%s, avatar),
-                        theme_color = COALESCE(%s, theme_color),
-                        font_family = COALESCE(%s, font_family)
+                        avatar           = COALESCE(%s, avatar),
+                        theme_color      = COALESCE(%s, theme_color),
+                        font_family      = COALESCE(%s, font_family),
+                        theme_mode       = COALESCE(%s, theme_mode),
+                        theme_secondary  = COALESCE(%s, theme_secondary),
+                        theme_updated_at = CASE WHEN %s THEN NOW() ELSE theme_updated_at END
                     WHERE email = %s AND is_verified = 1""",
                     (name, data.get('phone'), data.get('gmail_address'),
                      data.get('telegram_chat_id'), data.get('green_api_instance'),
                      data.get('green_api_token'),
-                     avatar, theme_color, font_family, email)
+                     avatar, theme_color, font_family, theme_mode, theme_secondary,
+                     bool(theme_color or font_family or theme_mode or theme_secondary),
+                     email)
                 )
         db.commit()
         return jsonify({"success": True})
