@@ -1,4 +1,4 @@
-print("=== MailNotifier API v4.0 - GMAIL OAUTH ===")
+print("=== MailNotifier API v4.1 - GMAIL OAUTH + FCM ===")
 import os
 import re
 import time
@@ -29,8 +29,30 @@ import psycopg2.pool
 import bcrypt
 import jwt
 from functools import wraps
+import firebase_admin
+from firebase_admin import credentials as fb_credentials, messaging as fb_messaging
 
 load_dotenv()
+
+# ─── FIREBASE ADMIN INIT ──────────────────────────────────────────────────────
+_firebase_initialized = False
+def _init_firebase():
+    global _firebase_initialized
+    if _firebase_initialized:
+        return
+    cred_json = os.getenv('FIREBASE_CREDENTIALS_JSON')
+    if not cred_json:
+        print("[Firebase] FIREBASE_CREDENTIALS_JSON manquant — push notifications désactivées")
+        return
+    try:
+        import json as _fbjson
+        cred_dict = _fbjson.loads(cred_json)
+        cred = fb_credentials.Certificate(cred_dict)
+        firebase_admin.initialize_app(cred)
+        _firebase_initialized = True
+        print("[Firebase] Admin SDK initialisé avec succès")
+    except Exception as e:
+        print(f"[Firebase] Erreur initialisation: {e}")
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB max request body
@@ -110,6 +132,7 @@ OAUTH_REDIRECT_URI   = os.getenv('OAUTH_REDIRECT_URI', 'https://backend-mail-1.o
 FRONTEND_URL         = os.getenv('FRONTEND_URL', 'https://bs-mailnotif-nine.vercel.app')
 GMAIL_SCOPES         = ['https://www.googleapis.com/auth/gmail.readonly']
 
+_init_firebase()
 notifier_status = {"running": False}
 
 # Middleware JWT pour sécuriser les endpoints
@@ -293,6 +316,7 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_refresh_token  TEXT")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_token_expiry   BIGINT")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_connected_email VARCHAR(150)")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT")
             # Promouvoir l'admin principal
             cur.execute("UPDATE users SET role='admin' WHERE email='kyliyanisse@gmail.com'")
             cur.execute("""
@@ -1348,6 +1372,79 @@ def update_user_settings():
 
 # ─── EMAIL MONITOR ────────────────────────────────────────────────────────────
 
+def _send_fcm_notification(fcm_token: str, title: str, body: str):
+    if not _firebase_initialized or not fcm_token:
+        return
+    try:
+        message = fb_messaging.Message(
+            notification=fb_messaging.Notification(title=title, body=body),
+            data={'click_action': 'FLUTTER_NOTIFICATION_CLICK'},
+            token=fcm_token,
+        )
+        fb_messaging.send(message)
+        print(f"[FCM] Push envoyée → {fcm_token[:20]}...")
+    except Exception as e:
+        print(f"[FCM] Erreur push: {e}")
+
+
+def _send_whatsapp_notification(user, sender: str, subject: str, snippet: str):
+    instance = user.get('green_api_instance')
+    token    = user.get('green_api_token')
+    phone    = user.get('phone')
+    if not instance or not token or not phone:
+        return
+    match = re.match(r'^(.+?)\s*<', sender)
+    sender_name = match.group(1).strip().strip('"') if match else sender.split('@')[0]
+    text = (
+        f"📧 *MailNotifier — Nouveau mail !*\n\n"
+        f"*De :* {sender_name}\n"
+        f"*Objet :* {subject}\n"
+        f"*Aperçu :* {snippet[:150]}"
+    )
+    try:
+        url = f"https://api.green-api.com/waInstance{instance}/sendMessage/{token}"
+        resp = requests.post(url, json={"chatId": f"{phone}@c.us", "message": text}, timeout=10)
+        if resp.ok:
+            print(f"[Monitor] WhatsApp OK → {phone}")
+        else:
+            print(f"[Monitor] WhatsApp erreur: {resp.status_code}")
+    except Exception as e:
+        print(f"[Monitor] WhatsApp exception: {e}")
+
+
+_SPAM_KEYWORDS = ['unsubscribe', 'désabonner', 'newsletter', 'promo', 'noreply', 'no-reply',
+                  'publicite', 'publicité', 'offre', 'soldes', 'réduction', 'discount']
+_IMPORTANT_KEYWORDS = ['urgent', 'important', 'facture', 'invoice', 'paiement', 'payment',
+                       'alerte', 'alert', 'sécurité', 'security', 'votre compte', 'your account']
+
+def _classify_email(sender: str, subject: str, snippet: str) -> str:
+    text = f"{sender} {subject} {snippet}".lower()
+    if any(k in text for k in _IMPORTANT_KEYWORDS):
+        return 'important'
+    if any(k in text for k in _SPAM_KEYWORDS):
+        return 'newsletter'
+    return 'normal'
+
+
+@app.route('/api/fcm/register', methods=['POST'])
+def register_fcm_token():
+    data  = request.get_json() or {}
+    email = _str(data.get('email'), 150).lower()
+    token = _str(data.get('fcm_token'), 500)
+    if not _is_valid_email(email) or not token:
+        return jsonify({'error': 'email et fcm_token requis'}), 400
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("UPDATE users SET fcm_token=%s WHERE email=%s AND is_verified=1", (token, email))
+        db.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        _return_db(db)
+
+
 def _send_telegram_notification(chat_id, sender, subject, snippet, user_email):
     if not TELEGRAM_BOT_TOKEN:
         print("[Monitor] TELEGRAM_BOT_TOKEN manquant — notification ignoree")
@@ -1427,12 +1524,29 @@ def _check_user_emails_gmail(user):
                         format='metadata',
                         metadataHeaders=['Subject', 'From'],
                     ).execute()
-                    hdrs    = {h['name']: h['value'] for h in msg.get('payload', {}).get('headers', [])}
-                    subject = hdrs.get('Subject', '(Sans objet)')
-                    sender  = hdrs.get('From', 'Inconnu')
-                    snippet = msg.get('snippet', '')[:200]
-                    if chat_id:
+                    hdrs     = {h['name']: h['value'] for h in msg.get('payload', {}).get('headers', [])}
+                    subject  = hdrs.get('Subject', '(Sans objet)')
+                    sender   = hdrs.get('From', 'Inconnu')
+                    snippet  = msg.get('snippet', '')[:200]
+                    category = _classify_email(sender, subject, snippet)
+                    print(f"[Monitor] Email [{category}] : {subject[:60]}")
+
+                    if chat_id and category != 'newsletter':
                         _send_telegram_notification(chat_id, sender, subject, snippet, user_email)
+
+                    if category == 'important':
+                        _send_whatsapp_notification(user, sender, subject, snippet)
+
+                    match_s = re.match(r'^(.+?)\s*<', sender)
+                    sender_name = match_s.group(1).strip().strip('"') if match_s else sender.split('@')[0]
+                    fcm_token = user.get('fcm_token')
+                    if fcm_token:
+                        emoji = '🔴' if category == 'important' else ('📰' if category == 'newsletter' else '✉️')
+                        _send_fcm_notification(
+                            fcm_token,
+                            title="MailNotifier — Nouveau mail",
+                            body=f"{emoji} {sender_name} : {subject[:80]}",
+                        )
                 except HttpError as e:
                     print(f"[Monitor] Erreur lecture msg {msg_id}: {e}")
 
@@ -1456,11 +1570,15 @@ def _check_all_users():
     try:
         with db.cursor() as cur:
             cur.execute("""
-                SELECT id, email, telegram_chat_id, last_history_id
+                SELECT id, email, telegram_chat_id, last_history_id,
+                       fcm_token, phone, green_api_instance, green_api_token
                 FROM users
                 WHERE gmail_refresh_token IS NOT NULL
-                  AND telegram_chat_id IS NOT NULL
-                  AND telegram_chat_id != ''
+                  AND (
+                    (telegram_chat_id IS NOT NULL AND telegram_chat_id != '')
+                    OR fcm_token IS NOT NULL
+                    OR green_api_instance IS NOT NULL
+                  )
                   AND is_verified = 1
             """)
             users = [dict(u) for u in cur.fetchall()]
