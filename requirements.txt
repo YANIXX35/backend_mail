@@ -14,3 +14,4 @@ flask-socketio==5.3.6
 python-socketio==5.11.3
 python-engineio==4.9.1
 PyJWT==2.8.0
+firebase-admin==6.5.0
