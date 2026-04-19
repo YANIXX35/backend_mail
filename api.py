@@ -1203,6 +1203,53 @@ def get_emails():
         return jsonify({"error": "Erreur lors de la récupération des emails"}), 500
 
 
+@app.route('/api/email/<message_id>')
+def get_email_detail(message_id):
+    email = request.args.get('email', '').strip().lower()
+    if not email or not message_id:
+        return jsonify({"error": "email et message_id requis"}), 400
+    try:
+        service = _get_gmail_service(email)
+        if not service:
+            return jsonify({"error": "Gmail non connecté"}), 401
+
+        msg = service.users().messages().get(
+            userId='me', id=message_id, format='full'
+        ).execute()
+
+        hdrs = {h['name']: h['value'] for h in msg.get('payload', {}).get('headers', [])}
+
+        def _extract_body(payload):
+            mime = payload.get('mimeType', '')
+            if mime in ('text/html', 'text/plain'):
+                data = payload.get('body', {}).get('data', '')
+                if data:
+                    import base64
+                    return mime, base64.urlsafe_b64decode(data + '==').decode('utf-8', errors='replace')
+            for part in payload.get('parts', []):
+                mime_type, content = _extract_body(part)
+                if content:
+                    return mime_type, content
+            return '', ''
+
+        mime_type, body = _extract_body(msg.get('payload', {}))
+
+        return jsonify({
+            "id":        message_id,
+            "subject":   hdrs.get('Subject', '(Sans objet)'),
+            "sender":    hdrs.get('From', 'Inconnu'),
+            "to":        hdrs.get('To', ''),
+            "date":      hdrs.get('Date', ''),
+            "snippet":   msg.get('snippet', ''),
+            "body":      body,
+            "body_type": mime_type,
+            "unread":    'UNREAD' in msg.get('labelIds', []),
+        })
+    except Exception as e:
+        print(f"[ERROR] get_email_detail: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/stats')
 def get_stats():
     email = request.args.get('email', '').strip().lower()
