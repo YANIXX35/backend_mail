@@ -854,13 +854,22 @@ def test_gmail_imap():
     passwd = data.get('app_password', '').replace(' ', '').strip()
     if not gmail or not passwd:
         return jsonify({'success': False, 'error': 'Adresse Gmail et mot de passe requis'}), 400
+    if len(passwd) != 16:
+        return jsonify({'success': False, 'error': f'Le code doit faire 16 caractères (reçu : {len(passwd)})'}), 400
     try:
         mail = imaplib.IMAP4_SSL('imap.gmail.com', 993)
         mail.login(gmail, passwd)
         mail.logout()
         return jsonify({'success': True})
-    except imaplib.IMAP4.error:
-        return jsonify({'success': False, 'error': 'Code incorrect ou IMAP desactive'}), 401
+    except imaplib.IMAP4.error as e:
+        msg = str(e).lower()
+        if 'webalert' in msg or 'web login' in msg or 'imap access' in msg:
+            error = "IMAP désactivé — active-le dans les paramètres Gmail (Paramètres > Voir tous > POP/IMAP)"
+        elif 'invalid credentials' in msg or 'authenticationfailed' in msg:
+            error = "Mot de passe d'application incorrect — génère un nouveau code sur myaccount.google.com/apppasswords"
+        else:
+            error = "Connexion refusée — vérifie que la validation en 2 étapes est activée et que le code est valide"
+        return jsonify({'success': False, 'error': error}), 401
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
