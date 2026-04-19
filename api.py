@@ -92,7 +92,7 @@ def add_security_headers(response):
         response.headers['Access-Control-Allow-Origin'] = '*'
     
     # Headers CORS complets
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Cache-Control, Pragma, X-Requested-With'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Cache-Control, Pragma, X-Requested-With, Expires'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS, PATCH'
     response.headers['Access-Control-Max-Age'] = '86400'  # 24 heures
     
@@ -114,7 +114,7 @@ def handle_options(path):
             response = jsonify({'status': 'preflight'})
             response.headers['Access-Control-Allow-Origin'] = origin
             response.headers['Access-Control-Allow-Credentials'] = 'true'
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Cache-Control, Pragma, X-Requested-With'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Cache-Control, Pragma, X-Requested-With, Expires'
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS, PATCH'
         response.headers['Access-Control-Max-Age'] = '86400'
     return response, 200
@@ -1203,6 +1203,53 @@ def get_emails():
         return jsonify({"error": "Erreur lors de la récupération des emails"}), 500
 
 
+@app.route('/api/email/<message_id>')
+def get_email_detail(message_id):
+    email = request.args.get('email', '').strip().lower()
+    if not email or not message_id:
+        return jsonify({"error": "email et message_id requis"}), 400
+    try:
+        service = _get_gmail_service(email)
+        if not service:
+            return jsonify({"error": "Gmail non connecté"}), 401
+
+        msg = service.users().messages().get(
+            userId='me', id=message_id, format='full'
+        ).execute()
+
+        hdrs = {h['name']: h['value'] for h in msg.get('payload', {}).get('headers', [])}
+
+        def _extract_body(payload):
+            mime = payload.get('mimeType', '')
+            if mime in ('text/html', 'text/plain'):
+                data = payload.get('body', {}).get('data', '')
+                if data:
+                    import base64
+                    return mime, base64.urlsafe_b64decode(data + '==').decode('utf-8', errors='replace')
+            for part in payload.get('parts', []):
+                mime_type, content = _extract_body(part)
+                if content:
+                    return mime_type, content
+            return '', ''
+
+        mime_type, body = _extract_body(msg.get('payload', {}))
+
+        return jsonify({
+            "id":        message_id,
+            "subject":   hdrs.get('Subject', '(Sans objet)'),
+            "sender":    hdrs.get('From', 'Inconnu'),
+            "to":        hdrs.get('To', ''),
+            "date":      hdrs.get('Date', ''),
+            "snippet":   msg.get('snippet', ''),
+            "body":      body,
+            "body_type": mime_type,
+            "unread":    'UNREAD' in msg.get('labelIds', []),
+        })
+    except Exception as e:
+        print(f"[ERROR] get_email_detail: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/stats')
 def get_stats():
     email = request.args.get('email', '').strip().lower()
@@ -1372,6 +1419,79 @@ def update_user_settings():
 
 # ─── EMAIL MONITOR ────────────────────────────────────────────────────────────
 
+def _send_fcm_notification(fcm_token: str, title: str, body: str):
+    if not _firebase_initialized or not fcm_token:
+        return
+    try:
+        message = fb_messaging.Message(
+            notification=fb_messaging.Notification(title=title, body=body),
+            data={'click_action': 'FLUTTER_NOTIFICATION_CLICK'},
+            token=fcm_token,
+        )
+        fb_messaging.send(message)
+        print(f"[FCM] Push envoyée → {fcm_token[:20]}...")
+    except Exception as e:
+        print(f"[FCM] Erreur push: {e}")
+
+
+def _send_whatsapp_notification(user, sender: str, subject: str, snippet: str):
+    instance = user.get('green_api_instance')
+    token    = user.get('green_api_token')
+    phone    = user.get('phone')
+    if not instance or not token or not phone:
+        return
+    match = re.match(r'^(.+?)\s*<', sender)
+    sender_name = match.group(1).strip().strip('"') if match else sender.split('@')[0]
+    text = (
+        f"📧 *MailNotifier — Nouveau mail !*\n\n"
+        f"*De :* {sender_name}\n"
+        f"*Objet :* {subject}\n"
+        f"*Aperçu :* {snippet[:150]}"
+    )
+    try:
+        url = f"https://api.green-api.com/waInstance{instance}/sendMessage/{token}"
+        resp = requests.post(url, json={"chatId": f"{phone}@c.us", "message": text}, timeout=10)
+        if resp.ok:
+            print(f"[Monitor] WhatsApp OK → {phone}")
+        else:
+            print(f"[Monitor] WhatsApp erreur: {resp.status_code}")
+    except Exception as e:
+        print(f"[Monitor] WhatsApp exception: {e}")
+
+
+_SPAM_KEYWORDS = ['unsubscribe', 'désabonner', 'newsletter', 'promo', 'noreply', 'no-reply',
+                  'publicite', 'publicité', 'offre', 'soldes', 'réduction', 'discount']
+_IMPORTANT_KEYWORDS = ['urgent', 'important', 'facture', 'invoice', 'paiement', 'payment',
+                       'alerte', 'alert', 'sécurité', 'security', 'votre compte', 'your account']
+
+def _classify_email(sender: str, subject: str, snippet: str) -> str:
+    text = f"{sender} {subject} {snippet}".lower()
+    if any(k in text for k in _IMPORTANT_KEYWORDS):
+        return 'important'
+    if any(k in text for k in _SPAM_KEYWORDS):
+        return 'newsletter'
+    return 'normal'
+
+
+@app.route('/api/fcm/register', methods=['POST'])
+def register_fcm_token():
+    data  = request.get_json() or {}
+    email = _str(data.get('email'), 150).lower()
+    token = _str(data.get('fcm_token'), 500)
+    if not _is_valid_email(email) or not token:
+        return jsonify({'error': 'email et fcm_token requis'}), 400
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("UPDATE users SET fcm_token=%s WHERE email=%s AND is_verified=1", (token, email))
+        db.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        _return_db(db)
+
+
 def _send_telegram_notification(chat_id, sender, subject, snippet, user_email):
     if not TELEGRAM_BOT_TOKEN:
         print("[Monitor] TELEGRAM_BOT_TOKEN manquant — notification ignoree")
@@ -1379,11 +1499,14 @@ def _send_telegram_notification(chat_id, sender, subject, snippet, user_email):
     match = re.match(r'^(.+?)\s*<', sender)
     sender_name = match.group(1).strip().strip('"') if match else sender.split('@')[0]
     text = (
-        f"\U0001f4e7 *Nouveau mail recu !*\n\n"
-        f"*De :* {sender_name}\n"
-        f"*Objet :* {subject}\n"
-        f"*Apercu :* {snippet}\n\n"
-        f"_Compte : {user_email}_"
+        f"📬 *MailNotifier*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Vous avez reçu un nouveau mail !\n\n"
+        f"👤 *De :* {sender_name}\n"
+        f"📌 *Objet :* {subject}\n"
+        f"💬 *Aperçu :*\n_{snippet[:200]}_\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🔔 Consultez votre boîte mail pour plus de détails."
     )
     try:
         resp = requests.post(
@@ -1405,86 +1528,6 @@ def _save_last_uid(user_id, uid):
         with db.cursor() as cur:
             cur.execute("UPDATE users SET last_history_id=%s WHERE id=%s", (str(uid), user_id))
         db.commit()
-    finally:
-        _return_db(db)
-
-
-def _send_fcm_notification(fcm_token: str, title: str, body: str):
-    """Envoie une push notification FCM sur le téléphone de l'utilisateur."""
-    if not _firebase_initialized or not fcm_token:
-        return
-    try:
-        message = fb_messaging.Message(
-            notification=fb_messaging.Notification(title=title, body=body),
-            data={'click_action': 'FLUTTER_NOTIFICATION_CLICK'},
-            token=fcm_token,
-        )
-        fb_messaging.send(message)
-        print(f"[FCM] Push envoyée → {fcm_token[:20]}...")
-    except Exception as e:
-        print(f"[FCM] Erreur push: {e}")
-
-
-def _send_whatsapp_notification(user, sender: str, subject: str, snippet: str):
-    """Envoie une notification WhatsApp via Green API."""
-    instance = user.get('green_api_instance')
-    token    = user.get('green_api_token')
-    phone    = user.get('phone')
-    if not instance or not token or not phone:
-        return
-    match = re.match(r'^(.+?)\s*<', sender)
-    sender_name = match.group(1).strip().strip('"') if match else sender.split('@')[0]
-    text = (
-        f"📧 *MailNotifier — Nouveau mail !*\n\n"
-        f"*De :* {sender_name}\n"
-        f"*Objet :* {subject}\n"
-        f"*Aperçu :* {snippet[:150]}"
-    )
-    try:
-        url = f"https://api.green-api.com/waInstance{instance}/sendMessage/{token}"
-        resp = requests.post(url, json={
-            "chatId": f"{phone}@c.us",
-            "message": text
-        }, timeout=10)
-        if resp.ok:
-            print(f"[Monitor] WhatsApp OK → {phone}")
-        else:
-            print(f"[Monitor] WhatsApp erreur: {resp.status_code}")
-    except Exception as e:
-        print(f"[Monitor] WhatsApp exception: {e}")
-
-
-_SPAM_KEYWORDS = ['unsubscribe', 'désabonner', 'newsletter', 'promo', 'noreply', 'no-reply',
-                  'publicite', 'publicité', 'offre', 'soldes', 'réduction', 'discount']
-_IMPORTANT_KEYWORDS = ['urgent', 'important', 'facture', 'invoice', 'paiement', 'payment',
-                       'alerte', 'alert', 'sécurité', 'security', 'votre compte', 'your account']
-
-def _classify_email(sender: str, subject: str, snippet: str) -> str:
-    """Classifie l'email : 'important', 'newsletter', ou 'normal'."""
-    text = f"{sender} {subject} {snippet}".lower()
-    if any(k in text for k in _IMPORTANT_KEYWORDS):
-        return 'important'
-    if any(k in text for k in _SPAM_KEYWORDS):
-        return 'newsletter'
-    return 'normal'
-
-
-@app.route('/api/fcm/register', methods=['POST'])
-def register_fcm_token():
-    """Enregistre le token FCM de l'utilisateur pour les push notifications."""
-    data  = request.get_json() or {}
-    email = _str(data.get('email'), 150).lower()
-    token = _str(data.get('fcm_token'), 500)
-    if not _is_valid_email(email) or not token:
-        return jsonify({'error': 'email et fcm_token requis'}), 400
-    db = get_db()
-    try:
-        with db.cursor() as cur:
-            cur.execute("UPDATE users SET fcm_token=%s WHERE email=%s AND is_verified=1", (token, email))
-        db.commit()
-        return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
     finally:
         _return_db(db)
 
@@ -1531,45 +1574,36 @@ def _check_user_emails_gmail(user):
                         format='metadata',
                         metadataHeaders=['Subject', 'From'],
                     ).execute()
-                    hdrs       = {h['name']: h['value'] for h in msg.get('payload', {}).get('headers', [])}
-                    subject    = hdrs.get('Subject', '(Sans objet)')
-                    sender     = hdrs.get('From', 'Inconnu')
-                    snippet    = msg.get('snippet', '')[:200]
-                    category   = _classify_email(sender, subject, snippet)
-
+                    hdrs     = {h['name']: h['value'] for h in msg.get('payload', {}).get('headers', [])}
+                    subject  = hdrs.get('Subject', '(Sans objet)')
+                    sender   = hdrs.get('From', 'Inconnu')
+                    snippet  = msg.get('snippet', '')[:200]
+                    category = _classify_email(sender, subject, snippet)
                     print(f"[Monitor] Email [{category}] : {subject[:60]}")
 
-                    # Telegram (tous les emails sauf newsletters)
                     if chat_id and category != 'newsletter':
                         _send_telegram_notification(chat_id, sender, subject, snippet, user_email)
 
-                    # WhatsApp (emails importants uniquement)
                     if category == 'important':
                         _send_whatsapp_notification(user, sender, subject, snippet)
 
-                    # Push FCM — notification sur le téléphone
-                    match = re.match(r'^(.+?)\s*<', sender)
-                    sender_name = match.group(1).strip().strip('"') if match else sender.split('@')[0]
+                    match_s = re.match(r'^(.+?)\s*<', sender)
+                    sender_name = match_s.group(1).strip().strip('"') if match_s else sender.split('@')[0]
                     fcm_token = user.get('fcm_token')
                     if fcm_token:
-                        if category == 'important':
-                            fcm_body = f"🔴 {sender_name} : {subject[:80]}"
-                        elif category == 'newsletter':
-                            fcm_body = f"📰 {sender_name} : {subject[:80]}"
-                        else:
-                            fcm_body = f"✉️ {sender_name} : {subject[:80]}"
+                        emoji = '🔴' if category == 'important' else ('📰' if category == 'newsletter' else '✉️')
                         _send_fcm_notification(
                             fcm_token,
                             title="MailNotifier — Nouveau mail",
-                            body=fcm_body,
+                            body=f"{emoji} {sender_name} : {subject[:80]}",
                         )
                 except HttpError as e:
                     print(f"[Monitor] Erreur lecture msg {msg_id}: {e}")
 
         except HttpError as e:
-            if 'Invalid startHistoryId' in str(e):
-                # historyId expiré (> 7 jours) — réinitialiser
-                print(f"[Monitor] historyId expiré pour {user_email}, réinitialisation")
+            err_str = str(e).lower()
+            if any(x in err_str for x in ['invalid starthistoryid', 'requested entity was not found', 'invalid history id', '404']):
+                print(f"[Monitor] historyId expiré pour {user_email}, réinitialisation → {current_history_id}")
                 _save_last_uid(user_id, current_history_id)
                 return
             raise
