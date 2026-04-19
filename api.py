@@ -1554,9 +1554,9 @@ def _check_user_emails_gmail(user):
                     print(f"[Monitor] Erreur lecture msg {msg_id}: {e}")
 
         except HttpError as e:
-            if 'Invalid startHistoryId' in str(e):
-                # historyId expiré (> 7 jours) — réinitialiser
-                print(f"[Monitor] historyId expiré pour {user_email}, réinitialisation")
+            err_str = str(e).lower()
+            if any(x in err_str for x in ['invalid starthistoryid', 'requested entity was not found', 'invalid history id', '404']):
+                print(f"[Monitor] historyId expiré pour {user_email}, réinitialisation → {current_history_id}")
                 _save_last_uid(user_id, current_history_id)
                 return
             raise
