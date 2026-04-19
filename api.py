@@ -15,15 +15,18 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import decode_header as _decode_header
 from datetime import datetime, timedelta
-from flask import Flask, jsonify, request, redirect
+from flask import Flask, jsonify, request, redirect, render_template
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from dotenv import load_dotenv
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 import bcrypt
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
+import jwt
+from functools import wraps
 
 load_dotenv()
 
@@ -38,6 +41,9 @@ ALLOWED_ORIGINS = [
     "http://localhost:4201",
 ]
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
+
+# Initialiser SocketIO pour WebSocket avec les mêmes origines que CORS
+socketio = SocketIO(app, cors_allowed_origins=ALLOWED_ORIGINS, async_mode='threading')
 
 # Rate limiting (mémoire locale — réinitialisé au redémarrage)
 # Désactivé en environnement de test (TESTING=1) pour éviter les conflits avec threading mocks
@@ -92,8 +98,68 @@ def handle_options(path):
 SMTP_EMAIL        = os.getenv('SMTP_EMAIL')
 SMTP_PASSWORD     = os.getenv('SMTP_PASSWORD')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+JWT_SECRET_KEY    = os.getenv('JWT_SECRET_KEY', 'your-secret-key-change-in-production')
+JWT_ALGORITHM     = 'HS256'
 
 notifier_status = {"running": False}
+
+# Middleware JWT pour sécuriser les endpoints
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        
+        # Vérifier le token dans le header Authorization
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            if auth_header.startswith('Bearer '):
+                token = auth_header.split(' ')[1]
+        
+        if not token:
+            return jsonify({'error': 'Token JWT requis'}), 401
+        
+        try:
+            # Décoder le token
+            payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+            user_id = payload['user_id']
+            user_email = payload['email']
+            
+            # Vérifier que l'utilisateur existe
+            db = get_db()
+            with db.cursor() as cur:
+                cur.execute("SELECT id, email FROM users WHERE id = %s AND email = %s", (user_id, user_email))
+                user = cur.fetchone()
+                
+            if not user:
+                return jsonify({'error': 'Utilisateur non trouvé'}), 401
+                
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'Token expiré'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'error': 'Token invalide'}), 401
+        except Exception as e:
+            print(f"[JWT ERROR] {e}")
+            return jsonify({'error': 'Erreur de validation du token'}), 401
+        finally:
+            if 'db' in locals():
+                db.close()
+        
+        # Ajouter les infos utilisateur à la request
+        request.current_user = {'id': user_id, 'email': user_email}
+        
+        return f(*args, **kwargs)
+    
+    return decorated
+
+def generate_token(user_id: int, email: str) -> str:
+    """Génère un token JWT pour l'utilisateur."""
+    payload = {
+        'user_id': user_id,
+        'email': email,
+        'exp': datetime.utcnow() + timedelta(hours=24),  # Expire dans 24h
+        'iat': datetime.utcnow()
+    }
+    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
 
 # ─── TELEGRAM BOT POLLING ─────────────────────────────────────────────────────
@@ -210,6 +276,9 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS theme_color VARCHAR(20)")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS font_family VARCHAR(60)")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS theme_mode       VARCHAR(10) DEFAULT 'light'")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS theme_secondary  VARCHAR(20)")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS theme_updated_at TIMESTAMP DEFAULT NOW()")
             # Promouvoir l'admin principal
             cur.execute("UPDATE users SET role='admin' WHERE email='kyliyanisse@gmail.com'")
             cur.execute("""
@@ -991,7 +1060,8 @@ def get_user_settings():
         with db.cursor() as cur:
             cur.execute(
                 "SELECT name, email, phone, gmail_address, telegram_chat_id, green_api_instance, "
-                "green_api_token, app_password, avatar, theme_color, font_family "
+                "green_api_token, app_password, avatar, theme_color, font_family, theme_mode, theme_secondary, "
+                "to_char(theme_updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS theme_updated_at "
                 "FROM users WHERE email = %s AND is_verified = 1",
                 (email,)
             )
@@ -1002,14 +1072,18 @@ def get_user_settings():
                 "gmail_address": "", "telegram_chat_id": "",
                 "green_api_instance": "", "green_api_token": "",
                 "app_password_set": False, "avatar": "",
-                "theme_color": "", "font_family": ""
+                "theme_color": "", "font_family": "", "theme_mode": "light",
+                "theme_secondary": "", "theme_updated_at": None
             })
         user = dict(user)
         for key in ["phone", "gmail_address", "telegram_chat_id", "green_api_instance",
-                    "green_api_token", "avatar", "theme_color", "font_family"]:
+                    "green_api_token", "avatar", "theme_color", "font_family",
+                    "theme_mode", "theme_secondary"]:  # theme_updated_at is a timestamp, handled separately
             if user.get(key) is None:
                 user[key] = ""
         user['app_password_set'] = bool(user.pop('app_password', None))
+        if not user.get('theme_mode'):
+            user['theme_mode'] = 'light'
         return jsonify(user)
     finally:
         _return_db(db)
@@ -1027,8 +1101,12 @@ def update_user_settings():
             app_password = (_str(data.get('app_password'), 200).replace(' ', '') or None)
             avatar      = _str(data.get('avatar'), 65535) or None   # base64 image
             name        = _str(data.get('name'), 100) or None
-            theme_color = _str(data.get('theme_color'), 20) or None
-            font_family = _str(data.get('font_family'), 60) or None
+            theme_color     = _str(data.get('theme_color'),     20) or None
+            font_family     = _str(data.get('font_family'),     60) or None
+            theme_mode      = _str(data.get('theme_mode'),      10) or None
+            theme_secondary = _str(data.get('theme_secondary'), 20) or None
+            if theme_mode and theme_mode not in ('light', 'dark'):
+                theme_mode = None
             if app_password:
                 cur.execute(
                     """UPDATE users SET
@@ -1040,13 +1118,18 @@ def update_user_settings():
                         green_api_token = %s,
                         app_password = %s,
                         avatar = COALESCE(%s, avatar),
-                        theme_color = COALESCE(%s, theme_color),
-                        font_family = COALESCE(%s, font_family)
+                        theme_color      = COALESCE(%s, theme_color),
+                        font_family      = COALESCE(%s, font_family),
+                        theme_mode       = COALESCE(%s, theme_mode),
+                        theme_secondary  = COALESCE(%s, theme_secondary),
+                        theme_updated_at = CASE WHEN %s THEN NOW() ELSE theme_updated_at END
                     WHERE email = %s AND is_verified = 1""",
                     (name, data.get('phone'), data.get('gmail_address'),
                      data.get('telegram_chat_id'), data.get('green_api_instance'),
                      data.get('green_api_token'), app_password,
-                     avatar, theme_color, font_family, email)
+                     avatar, theme_color, font_family, theme_mode, theme_secondary,
+                     bool(theme_color or font_family or theme_mode or theme_secondary),
+                     email)
                 )
             else:
                 cur.execute(
@@ -1057,14 +1140,19 @@ def update_user_settings():
                         telegram_chat_id = %s,
                         green_api_instance = %s,
                         green_api_token = %s,
-                        avatar = COALESCE(%s, avatar),
-                        theme_color = COALESCE(%s, theme_color),
-                        font_family = COALESCE(%s, font_family)
+                        avatar           = COALESCE(%s, avatar),
+                        theme_color      = COALESCE(%s, theme_color),
+                        font_family      = COALESCE(%s, font_family),
+                        theme_mode       = COALESCE(%s, theme_mode),
+                        theme_secondary  = COALESCE(%s, theme_secondary),
+                        theme_updated_at = CASE WHEN %s THEN NOW() ELSE theme_updated_at END
                     WHERE email = %s AND is_verified = 1""",
                     (name, data.get('phone'), data.get('gmail_address'),
                      data.get('telegram_chat_id'), data.get('green_api_instance'),
                      data.get('green_api_token'),
-                     avatar, theme_color, font_family, email)
+                     avatar, theme_color, font_family, theme_mode, theme_secondary,
+                     bool(theme_color or font_family or theme_mode or theme_secondary),
+                     email)
                 )
         db.commit()
         return jsonify({"success": True})
@@ -1273,6 +1361,414 @@ def monitor_test():
 
 
 # ─── STARTUP (fonctionne avec gunicorn ET python api.py) ─────────────────────
+@limiter.limit("20 per minute")
+@app.route('/api/preferences', methods=['GET'])
+@limiter.limit("20 per minute")
+@token_required
+def get_preferences():
+    """Récupérer les préférences utilisateur (sécurisé avec JWT)."""
+    user_id = request.current_user['id']
+    
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            cur.execute("""
+                SELECT preference_key, preference_value, updated_at, version
+                FROM user_preferences 
+                WHERE user_id = %s
+                ORDER BY updated_at DESC
+            """, (user_id,))
+            
+            preferences = cur.fetchall()
+            
+        return jsonify({
+            'preferences': [
+                {
+                    'key': row['preference_key'],
+                    'value': row['preference_value'],
+                    'updated_at': str(row['updated_at']),
+                    'version': row['version']
+                } for row in preferences
+            ],
+            'user_id': user_id
+        }), 200
+        
+    except Exception as e:
+        print(f"[ERROR] Get preferences: {e}")
+        return jsonify({'error': 'Erreur lors de la récupération des préférences'}), 500
+        
+    finally:
+        if 'db' in locals():
+            db.close()
+
+@app.route('/api/preferences', methods=['POST'])
+@limiter.limit("20 per minute")
+@token_required
+def update_preferences():
+    """Mettre à jour les préférences utilisateur (sécurisé avec JWT + gestion conflits)."""
+    data = request.json
+    if not data or not isinstance(data, dict):
+        return jsonify({'error': 'Données invalides'}), 400
+    
+    preferences = data.get('preferences', {})
+    client_version = data.get('version', 0)
+    
+    if not preferences:
+        return jsonify({'error': 'preferences requis'}), 400
+    
+    user_id = request.current_user['id']
+    
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            # Vérifier la version actuelle pour gestion des conflits
+            cur.execute("""
+                SELECT MAX(version) as current_version
+                FROM user_preferences 
+                WHERE user_id = %s
+            """, (user_id,))
+            
+            result = cur.fetchone()
+            current_version = result['current_version'] or 0
+            
+            # Gestion des conflits : si la version client est plus ancienne, retourner conflit
+            if client_version > 0 and client_version < current_version:
+                # Récupérer les préférences actuelles
+                cur.execute("""
+                    SELECT preference_key, preference_value, version
+                    FROM user_preferences 
+                    WHERE user_id = %s AND version = %s
+                """, (user_id, current_version))
+                
+                current_prefs = cur.fetchall()
+                
+                return jsonify({
+                    'error': 'CONFLICT',
+                    'message': 'Vos préférences ont été modifiées sur un autre appareil',
+                    'current_preferences': {
+                        pref['preference_key']: pref['preference_value'] 
+                        for pref in current_prefs
+                    },
+                    'current_version': current_version
+                }), 409
+            
+            # Nouvelle version pour cette mise à jour
+            new_version = current_version + 1
+            
+            # Insérer les nouvelles préférences avec version
+            for key, value in preferences.items():
+                cur.execute("""
+                    INSERT INTO user_preferences (user_id, preference_key, preference_value, version)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (user_id, preference_key) 
+                    DO UPDATE SET 
+                        preference_value = EXCLUDED.preference_value,
+                        version = EXCLUDED.version,
+                        updated_at = CURRENT_TIMESTAMP
+                """, (user_id, key, value, new_version))
+            
+            db.commit()
+            
+        # Notifier WebSocket pour temps réel
+        socketio.emit('preference_updated', {
+            'user_id': user_id,
+            'preferences': preferences,
+            'version': new_version,
+            'updated_at': datetime.utcnow().isoformat()
+        }, room=f"user_{user_id}")
+        
+        print(f"[PREFERENCES] Préférences mises à jour pour user {user_id} (version {new_version})")
+        
+        return jsonify({
+            'message': 'Préférences mises à jour avec succès',
+            'version': new_version
+        }), 200
+        
+    except Exception as e:
+        print(f"[ERROR] Update preferences: {e}")
+        return jsonify({'error': 'Erreur lors de la mise à jour des préférences'}), 500
+        
+    finally:
+        if 'db' in locals():
+            db.close()
+
+@app.route('/api/auth/token', methods=['POST'])
+@limiter.limit("10 per minute")
+def get_auth_token():
+    """Génère un token JWT pour l'utilisateur authentifié."""
+    email = request.json.get('email')
+    password = request.json.get('password')
+    
+    if not email or not password:
+        return jsonify({'error': 'Email et mot de passe requis'}), 400
+    
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            cur.execute("SELECT id, email, password FROM users WHERE email = %s", (email,))
+            user = cur.fetchone()
+            
+            if not user or not bcrypt.checkpw(password.encode('utf-8'), user['password'].encode('utf-8')):
+                return jsonify({'error': 'Email ou mot de passe incorrect'}), 401
+            
+            # Générer le token JWT
+            token = generate_token(user['id'], user['email'])
+            
+            return jsonify({
+                'token': token,
+                'user_id': user['id'],
+                'email': user['email'],
+                'expires_in': 24 * 3600  # 24 heures en secondes
+            }), 200
+            
+    except Exception as e:
+        print(f"[ERROR] Auth token: {e}")
+        return jsonify({'error': 'Erreur lors de l\'authentification'}), 500
+        
+    finally:
+        if 'db' in locals():
+            db.close()
+
+@socketio.on('connect')
+def handle_connect():
+    """Gère la connexion WebSocket avec authentification JWT."""
+    token = request.args.get('token')
+    user_id = None
+    
+    if token:
+        try:
+            # Valider le token JWT
+            payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+            user_id = payload['user_id']
+            
+            # Vérifier que l'utilisateur existe
+            db = get_db()
+            with db.cursor() as cur:
+                cur.execute("SELECT id, email FROM users WHERE id = %s", (user_id,))
+                user = cur.fetchone()
+                
+            if user:
+                join_room(f"user_{user_id}")
+                print(f"[WEBSOCKET] User {user_id} connecté avec succès")
+                emit('connected', {
+                    'message': f'Connecté avec succès pour user {user_id}',
+                    'user_id': user_id,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+            else:
+                print(f"[WEBSOCKET] Token valide mais utilisateur {user_id} non trouvé")
+                emit('error', {'message': 'Utilisateur non trouvé'})
+                return False
+                
+        except jwt.ExpiredSignatureError:
+            print(f"[WEBSOCKET] Token expiré")
+            emit('error', {'message': 'Token expiré'})
+            return False
+        except jwt.InvalidTokenError:
+            print(f"[WEBSOCKET] Token invalide")
+            emit('error', {'message': 'Token invalide'})
+            return False
+        except Exception as e:
+            print(f"[WEBSOCKET] Erreur validation token: {e}")
+            emit('error', {'message': 'Erreur d\'authentification'})
+            return False
+        finally:
+            if 'db' in locals():
+                db.close()
+    else:
+        print(f"[WEBSOCKET] Connexion sans token")
+        emit('error', {'message': 'Token requis'})
+        return False
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Gère la déconnexion WebSocket."""
+    print(f"[WEBSOCKET] Utilisateur déconnecté")
+
+@socketio.on('ping')
+def handle_ping():
+    """Gère le ping pour keep-alive."""
+    emit('pong', {'timestamp': datetime.utcnow().isoformat()})
+
+@socketio.on('join_user_room')
+def handle_join_user_room(data):
+    """Rejoint la room utilisateur spécifique avec validation."""
+    user_id = data.get('user_id')
+    token = data.get('token')
+    
+    if not token:
+        emit('error', {'message': 'Token requis'})
+        return
+    
+    try:
+        # Valider le token
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        token_user_id = payload['user_id']
+        
+        if str(token_user_id) != str(user_id):
+            emit('error', {'message': 'Token invalide pour cet utilisateur'})
+            return
+        
+        join_room(f"user_{user_id}")
+        emit('joined_room', {
+            'room': f"user_{user_id}",
+            'timestamp': datetime.utcnow().isoformat()
+        })
+        
+        print(f"[WEBSOCKET] User {user_id} a rejoint sa room")
+        
+    except jwt.InvalidTokenError:
+        emit('error', {'message': 'Token invalide'})
+    except Exception as e:
+        print(f"[WEBSOCKET] Erreur join room: {e}")
+        emit('error', {'message': 'Erreur lors de la jonction de la room'})
+
+# Système de ping/pong automatique pour maintenir les connexions
+@socketio.on('keep_alive')
+def handle_keep_alive():
+    """Répond au keep-alive pour maintenir la connexion."""
+    emit('keep_alive_response', {
+        'timestamp': datetime.utcnow().isoformat(),
+        'status': 'alive'
+    })
+
+@app.route('/api/dashboard/advanced-stats', methods=['GET'])
+@limiter.limit("20 per minute")
+def get_advanced_stats():
+    """Endpoint pour récupérer les statistiques avancées du tableau de bord."""
+    email = request.args.get('email')
+    period = int(request.args.get('period', 30))  # jours
+    status = request.args.get('status', 'all')
+    sender_filter = request.args.get('sender', '')
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    
+    if not email:
+        return jsonify({'error': 'Email requis'}), 400
+    
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            # Statistiques générales
+            cur.execute("""
+                SELECT 
+                    COUNT(*) as total_emails,
+                    SUM(CASE WHEN is_read = false THEN 1 ELSE 0 END) as unread_emails,
+                    SUM(CASE WHEN is_sent = true THEN 1 ELSE 0 END) as sent_emails,
+                    DATE(sent_at) as last_email_date
+                FROM emails 
+                WHERE user_email = %s
+            """, (email,))
+            
+            stats = cur.fetchone()
+            
+            # Évolution temporelle
+            cur.execute("""
+                SELECT 
+                    DATE(sent_at) as date,
+                    COUNT(*) as count,
+                    SUM(CASE WHEN is_read = false THEN 1 ELSE 0 END) as unread
+                FROM emails 
+                WHERE user_email = %s 
+                    AND sent_at >= CURRENT_DATE - INTERVAL '%s days'
+                GROUP BY DATE(sent_at)
+                ORDER BY date DESC
+            """, (email, period))
+            
+            evolution = cur.fetchall()
+            
+            # Répartition par statut
+            cur.execute("""
+                SELECT 
+                    CASE WHEN is_read = true THEN 'Lus' ELSE 'Non lus' END as status,
+                    COUNT(*) as count
+                FROM emails 
+                WHERE user_email = %s
+                GROUP BY is_read
+            """, (email,))
+            
+            status_distribution = cur.fetchall()
+            
+            # Top expéditeurs
+            cur.execute("""
+                SELECT 
+                    sender,
+                    COUNT(*) as count
+                FROM emails 
+                WHERE user_email = %s
+                    AND sender IS NOT NULL
+                GROUP BY sender
+                ORDER BY count DESC
+                LIMIT 10
+            """, (email,))
+            
+            top_senders = cur.fetchall()
+            
+        return jsonify({
+            'total_emails': int(stats['total_emails'] or 0),
+            'unread_emails': int(stats['unread_emails'] or 0),
+            'sent_emails': int(stats['sent_emails'] or 0),
+            'average_per_day': round(int(stats['total_emails'] or 0) / period, 1),
+            'evolution': [
+                {
+                    'date': str(row['date']),
+                    'count': int(row['count']),
+                    'unread': int(row['unread'])
+                } for row in evolution
+            ],
+            'status_distribution': [
+                {
+                    'status': row['status'],
+                    'count': int(row['count'])
+                } for row in status_distribution
+            ],
+            'top_senders': [
+                {
+                    'sender': row['sender'],
+                    'count': int(row['count'])
+                } for row in top_senders
+            ]
+        }), 200
+        
+    except Exception as e:
+        print(f"[ERROR] Advanced stats: {e}")
+        return jsonify({'error': 'Erreur lors de la récupération des statistiques'}), 500
+        
+    finally:
+        if 'db' in locals():
+            db.close()
+
+
+def init_user_preferences():
+    """Initialise la table user_preferences pour la synchronisation."""
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_preferences (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    preference_key VARCHAR(100) NOT NULL,
+                    preference_value TEXT,
+                    version INTEGER DEFAULT 1,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, preference_key)
+                )
+            """)
+            
+            # Ajouter le champ version s'il n'existe pas
+            cur.execute("""
+                ALTER TABLE user_preferences 
+                ADD COLUMN IF NOT EXISTS version INTEGER DEFAULT 1
+            """)
+            
+            db.commit()
+            print("[DB] Table user_preferences créée/mise à jour avec succès")
+    except Exception as e:
+        print(f"[ERROR] Erreur création table user_preferences: {e}")
+        db.rollback()
+    finally:
+        db.close()
 
 def _startup():
     # Skip startup in test environment (avoids real DB connections and daemon threads)
@@ -1281,6 +1777,7 @@ def _startup():
     print("[STARTUP] Debut de l'initialisation...")
     try:
         init_db()
+        init_user_preferences()  # Initialiser la table des préférences
         notifier_status["running"] = True
         print("[STARTUP] Lancement thread TelegramBot...")
         threading.Thread(target=telegram_bot_polling, daemon=True, name="tg-bot").start()
