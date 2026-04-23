@@ -1183,13 +1183,17 @@ def get_emails():
                     metadataHeaders=['Subject', 'From', 'Date'],
                 ).execute()
                 hdrs = {h['name']: h['value'] for h in msg.get('payload', {}).get('headers', [])}
+                subject = hdrs.get('Subject', '(Sans objet)')
+                sender  = hdrs.get('From', 'Inconnu')
+                snippet = msg.get('snippet', '')[:150]
                 emails.append({
-                    "id":      msg['id'],
-                    "subject": hdrs.get('Subject', '(Sans objet)'),
-                    "sender":  hdrs.get('From', 'Inconnu'),
-                    "date":    hdrs.get('Date', ''),
-                    "snippet": msg.get('snippet', '')[:150],
-                    "unread":  'UNREAD' in msg.get('labelIds', []),
+                    "id":       msg['id'],
+                    "subject":  subject,
+                    "sender":   sender,
+                    "date":     hdrs.get('Date', ''),
+                    "snippet":  snippet,
+                    "unread":   'UNREAD' in msg.get('labelIds', []),
+                    "category": _classify_email(sender, subject, snippet),
                 })
             except HttpError:
                 continue
@@ -1233,17 +1237,21 @@ def get_email_detail(message_id):
             return '', ''
 
         mime_type, body = _extract_body(msg.get('payload', {}))
+        subject = hdrs.get('Subject', '(Sans objet)')
+        sender  = hdrs.get('From', 'Inconnu')
+        snippet = msg.get('snippet', '')
 
         return jsonify({
             "id":        message_id,
-            "subject":   hdrs.get('Subject', '(Sans objet)'),
-            "sender":    hdrs.get('From', 'Inconnu'),
+            "subject":   subject,
+            "sender":    sender,
             "to":        hdrs.get('To', ''),
             "date":      hdrs.get('Date', ''),
-            "snippet":   msg.get('snippet', ''),
+            "snippet":   snippet,
             "body":      body,
             "body_type": mime_type,
             "unread":    'UNREAD' in msg.get('labelIds', []),
+            "category":  _classify_email(sender, subject, snippet),
         })
     except Exception as e:
         print(f"[ERROR] get_email_detail: {e}")
@@ -1459,17 +1467,43 @@ def _send_whatsapp_notification(user, sender: str, subject: str, snippet: str):
         print(f"[Monitor] WhatsApp exception: {e}")
 
 
-_SPAM_KEYWORDS = ['unsubscribe', 'désabonner', 'newsletter', 'promo', 'noreply', 'no-reply',
-                  'publicite', 'publicité', 'offre', 'soldes', 'réduction', 'discount']
-_IMPORTANT_KEYWORDS = ['urgent', 'important', 'facture', 'invoice', 'paiement', 'payment',
-                       'alerte', 'alert', 'sécurité', 'security', 'votre compte', 'your account']
+_NEWSLETTER_KEYWORDS = [
+    'unsubscribe', 'désabonner', 'newsletter', 'noreply', 'no-reply',
+    'do-not-reply', 'donotreply', 'ne pas répondre',
+    'publicite', 'publicité', 'soldes', 'réduction', 'discount',
+    'marketing', 'promotion', 'deal', 'offre spéciale', 'bon plan',
+    'weekly digest', 'monthly digest', 'bulletin mensuel', 'bulletin hebdo',
+]
+_IMPORTANT_KEYWORDS = [
+    'urgent', 'important', 'facture', 'invoice', 'paiement', 'payment',
+    'alerte', 'alert', 'sécurité', 'security', 'votre compte', 'your account',
+    'action requise', 'action required', 'délai', 'deadline', 'expiration',
+    'confirmation', 'virement', 'remboursement', 'refund', 'commande', 'order',
+    'rendez-vous', 'appointment', 'contrat', 'contract', 'signature',
+    'mot de passe', 'password', 'authentification', 'verification', 'code',
+    'incident', 'problème', 'error', 'erreur', 'échec', 'failed',
+    'réunion', 'meeting', 'convocation', 'entretien', 'interview',
+]
+_NEWSLETTER_DOMAINS = [
+    'mailchimp', 'sendgrid', 'klaviyo', 'constantcontact', 'hubspot',
+    'mailjet', 'sendinblue', 'brevo', 'campaignmonitor', 'aweber',
+]
 
 def _classify_email(sender: str, subject: str, snippet: str) -> str:
-    text = f"{sender} {subject} {snippet}".lower()
+    sender_l  = sender.lower()
+    subject_l = subject.lower()
+    text      = f"{sender_l} {subject_l} {snippet.lower()}"
+
+    # Newsletter: sender domain or keywords
+    if any(d in sender_l for d in _NEWSLETTER_DOMAINS):
+        return 'newsletter'
+    if any(k in text for k in _NEWSLETTER_KEYWORDS):
+        return 'newsletter'
+    # Important: keywords in subject (higher weight) or text
+    if any(k in subject_l for k in _IMPORTANT_KEYWORDS):
+        return 'important'
     if any(k in text for k in _IMPORTANT_KEYWORDS):
         return 'important'
-    if any(k in text for k in _SPAM_KEYWORDS):
-        return 'newsletter'
     return 'normal'
 
 
@@ -1492,16 +1526,22 @@ def register_fcm_token():
         _return_db(db)
 
 
-def _send_telegram_notification(chat_id, sender, subject, snippet, user_email):
+def _send_telegram_notification(chat_id, sender, subject, snippet, user_email, category='normal'):
     if not TELEGRAM_BOT_TOKEN:
         print("[Monitor] TELEGRAM_BOT_TOKEN manquant — notification ignoree")
         return
     match = re.match(r'^(.+?)\s*<', sender)
     sender_name = match.group(1).strip().strip('"') if match else sender.split('@')[0]
+    cat_labels = {
+        'important':  '🔴 *Important*',
+        'newsletter': '🟡 Newsletter',
+        'normal':     '🔵 Normal',
+    }
+    cat_label = cat_labels.get(category, '🔵 Normal')
     text = (
         f"📬 *MailNotifier*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"Vous avez reçu un nouveau mail !\n\n"
+        f"Nouveau mail reçu — {cat_label}\n\n"
         f"👤 *De :* {sender_name}\n"
         f"📌 *Objet :* {subject}\n"
         f"💬 *Aperçu :*\n_{snippet[:200]}_\n\n"
@@ -1581,8 +1621,8 @@ def _check_user_emails_gmail(user):
                     category = _classify_email(sender, subject, snippet)
                     print(f"[Monitor] Email [{category}] : {subject[:60]}")
 
-                    if chat_id and category != 'newsletter':
-                        _send_telegram_notification(chat_id, sender, subject, snippet, user_email)
+                    if chat_id:
+                        _send_telegram_notification(chat_id, sender, subject, snippet, user_email, category)
 
                     if category == 'important':
                         _send_whatsapp_notification(user, sender, subject, snippet)
