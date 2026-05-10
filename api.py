@@ -126,9 +126,9 @@ JWT_SECRET_KEY    = os.getenv('JWT_SECRET_KEY', 'your-secret-key-change-in-produ
 JWT_ALGORITHM     = 'HS256'
 
 # ─── GREEN-API (WhatsApp) — instance partagée admin ───────────────────────────
-GREEN_API_URL      = os.getenv('GREEN_API_URL', 'https://api.green-api.com')
-GREEN_API_INSTANCE = os.getenv('GREEN_API_INSTANCE')
-GREEN_API_TOKEN    = os.getenv('GREEN_API_TOKEN')
+GREEN_API_URL      = (os.getenv('GREEN_API_URL') or 'https://api.green-api.com').strip()
+GREEN_API_INSTANCE = (os.getenv('GREEN_API_INSTANCE') or '').strip() or None
+GREEN_API_TOKEN    = (os.getenv('GREEN_API_TOKEN') or '').strip() or None
 
 # ─── GOOGLE OAUTH CONFIG ──────────────────────────────────────────────────────
 GOOGLE_CLIENT_ID     = os.getenv('GOOGLE_CLIENT_ID')
