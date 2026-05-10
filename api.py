@@ -1397,6 +1397,28 @@ def get_stats():
 
 # ─── USER SETTINGS ────────────────────────────────────────────────────────────
 
+@app.route('/api/user/whatsapp-check', methods=['GET'])
+def whatsapp_check_number():
+    """Vérifie si un numéro est sur WhatsApp via checkWhatsapp."""
+    phone = (request.args.get('phone') or '').strip()
+    if not phone:
+        return jsonify({"error": "phone requis"}), 400
+    if not GREEN_API_INSTANCE or not GREEN_API_TOKEN:
+        return jsonify({"error": "WhatsApp non configuré"}), 503
+    phone_clean = re.sub(r'\D', '', phone)
+    try:
+        url = f"{GREEN_API_URL}/waInstance{GREEN_API_INSTANCE}/checkWhatsapp/{GREEN_API_TOKEN}"
+        resp = requests.post(url, json={"phoneNumber": phone_clean}, timeout=10)
+        if resp.ok and resp.text.strip():
+            data = resp.json()
+            exists = data.get('existsWhatsapp', False)
+            chat_id = data.get('chatId', '') if exists else ''
+            return jsonify({"exists": exists, "chatId": chat_id, "phone": phone_clean})
+        return jsonify({"exists": False, "chatId": "", "phone": phone_clean})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/user/whatsapp-qr', methods=['GET'])
 def get_whatsapp_qr():
     if not GREEN_API_INSTANCE or not GREEN_API_TOKEN:
