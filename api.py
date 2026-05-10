@@ -1577,17 +1577,17 @@ def _send_whatsapp_notification(user, sender: str, subject: str, snippet: str, c
         return
     match = re.match(r'^(.+?)\s*<', sender)
     sender_name = match.group(1).strip().strip('"') if match else sender.split('@')[0]
-    cat_labels = {'important': '🔴 Important', 'newsletter': '🟡 Newsletter', 'normal': '🔵 Normal'}
-    cat_label = cat_labels.get(category, '🔵 Normal')
+    cat_labels = {'important': '[!] Important', 'newsletter': '[~] Newsletter', 'normal': '[*] Normal'}
+    cat_label = cat_labels.get(category, '[*] Normal')
     text = (
-        f"📬 *MailNotifier*\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"Nouveau mail — {cat_label}\n\n"
+        f"*MailNotifier*\n"
+        f"------------------\n"
+        f"Nouveau mail - {cat_label}\n\n"
         f"*De :* {sender_name}\n"
         f"*Objet :* {subject}\n"
-        f"*Aperçu :* {snippet[:150]}\n\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🔔 Consultez votre boîte mail."
+        f"*Apercu :* {snippet[:150]}\n\n"
+        f"------------------\n"
+        f"Consultez votre boite mail."
     )
     try:
         # Préférer le chatId stocké en BDD (évite checkWhatsapp)
