@@ -1496,6 +1496,17 @@ def update_user_settings():
                 v = data.get(key)
                 return v if v not in (None, '') else None
 
+            # Si le numéro de téléphone change → effacer whatsapp_chat_id
+            new_phone_raw = _val('phone')
+            if new_phone_raw:
+                cur.execute("SELECT phone FROM users WHERE email = %s AND is_verified = 1", (email,))
+                old_row = cur.fetchone()
+                old_phone_clean = re.sub(r'\D', '', old_row.get('phone') or '') if old_row else ''
+                new_phone_clean = re.sub(r'\D', '', new_phone_raw)
+                if old_phone_clean != new_phone_clean:
+                    cur.execute("UPDATE users SET whatsapp_chat_id = NULL WHERE email = %s", (email,))
+                    print(f"[Settings] Phone changé ({old_phone_clean}→{new_phone_clean}), whatsapp_chat_id effacé")
+
             if app_password:
                 cur.execute(
                     """UPDATE users SET
