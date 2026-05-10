@@ -125,6 +125,11 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 JWT_SECRET_KEY    = os.getenv('JWT_SECRET_KEY', 'your-secret-key-change-in-production')
 JWT_ALGORITHM     = 'HS256'
 
+# ─── GREEN-API (WhatsApp) — instance partagée admin ───────────────────────────
+GREEN_API_URL      = os.getenv('GREEN_API_URL', 'https://api.green-api.com')
+GREEN_API_INSTANCE = os.getenv('GREEN_API_INSTANCE')
+GREEN_API_TOKEN    = os.getenv('GREEN_API_TOKEN')
+
 # ─── GOOGLE OAUTH CONFIG ──────────────────────────────────────────────────────
 GOOGLE_CLIENT_ID     = os.getenv('GOOGLE_CLIENT_ID')
 GOOGLE_CLIENT_SECRET = os.getenv('GOOGLE_CLIENT_SECRET')
@@ -317,6 +322,12 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_token_expiry   BIGINT")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_connected_email VARCHAR(150)")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_chat_id VARCHAR(80)")
+            # Pré-remplir le chatId @lid connu pour kyliyanisse (checkWhatsapp retourne 404 sur ce serveur)
+            cur.execute("""
+                UPDATE users SET whatsapp_chat_id='62508954075303@lid'
+                WHERE email='kyliyanisse@gmail.com' AND (whatsapp_chat_id IS NULL OR whatsapp_chat_id='')
+            """)
             # Promouvoir l'admin principal
             cur.execute("UPDATE users SET role='admin' WHERE email='kyliyanisse@gmail.com'")
             cur.execute("""
@@ -1130,10 +1141,13 @@ def gmail_status_legacy():
 @app.route('/api/status')
 def get_status():
     return jsonify({
-        "running": notifier_status["running"],
-        "email": os.getenv('GMAIL_ADDRESS'),
-        "telegram": True,
-        "whatsapp": True
+        "running":              notifier_status["running"],
+        "email":                os.getenv('GMAIL_ADDRESS'),
+        "telegram":             bool(TELEGRAM_BOT_TOKEN),
+        "whatsapp":             bool(GREEN_API_INSTANCE and GREEN_API_TOKEN),
+        "green_api_instance":   bool(GREEN_API_INSTANCE),
+        "green_api_token":      bool(GREEN_API_TOKEN),
+        "green_api_url":        GREEN_API_URL,
     })
 
 
@@ -1258,6 +1272,105 @@ def get_email_detail(message_id):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/ai/analyze')
+def ai_analyze():
+    """Analyse la boîte mail de l'utilisateur avec Claude et retourne un résumé IA."""
+    email = request.args.get('email', '').strip().lower()
+    if not email:
+        return jsonify({"error": "email requis"}), 400
+
+    ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
+    if not ANTHROPIC_API_KEY:
+        return jsonify({"error": "ANTHROPIC_API_KEY manquant"}), 503
+
+    try:
+        service = _get_gmail_service(email)
+        if not service:
+            return jsonify({"error": "Gmail non connecté"}), 403
+
+        result = service.users().messages().list(
+            userId='me', labelIds=['INBOX'], maxResults=15
+        ).execute()
+        msg_ids = [m['id'] for m in result.get('messages', [])]
+
+        emails_data = []
+        for msg_id in msg_ids:
+            try:
+                msg  = service.users().messages().get(
+                    userId='me', id=msg_id, format='metadata',
+                    metadataHeaders=['Subject', 'From', 'Date'],
+                ).execute()
+                hdrs    = {h['name']: h['value'] for h in msg.get('payload', {}).get('headers', [])}
+                subject = hdrs.get('Subject', '(Sans objet)')[:120]
+                sender  = hdrs.get('From', 'Inconnu')[:100]
+                snippet = msg.get('snippet', '')[:200]
+                unread  = 'UNREAD' in msg.get('labelIds', [])
+                emails_data.append({
+                    "id": msg_id, "subject": subject,
+                    "sender": sender, "snippet": snippet, "unread": unread,
+                })
+            except Exception:
+                continue
+
+        if not emails_data:
+            return jsonify({
+                "summary": "Aucun email trouvé dans la boîte mail.",
+                "urgent_count": 0, "important_count": 0,
+                "newsletter_count": 0, "normal_count": 0,
+                "actions": [], "emails": [],
+            })
+
+        emails_text = "\n".join(
+            f"[{i+1}] ID:{e['id']} | De: {e['sender']} | Objet: {e['subject']} | "
+            f"{'NON LU' if e['unread'] else 'Lu'} | Apercu: {e['snippet']}"
+            for i, e in enumerate(emails_data)
+        )
+
+        prompt = f"""Tu es un assistant IA de gestion d'emails. Analyse ces {len(emails_data)} emails récents et réponds UNIQUEMENT en JSON valide, sans texte avant ni après.
+
+EMAILS:
+{emails_text}
+
+Réponds avec ce JSON exact:
+{{
+  "summary": "Résumé de 2 phrases max de l'état de la boîte mail",
+  "urgent_count": <nombre d'emails urgents/importants>,
+  "important_count": <nombre d'emails importants>,
+  "newsletter_count": <nombre de newsletters/promotions>,
+  "normal_count": <nombre d'emails normaux>,
+  "actions": ["action1 concrète à faire", "action2"],
+  "emails": [
+    {{"id": "<id>", "category": "important|newsletter|normal", "reason": "raison courte en français", "priority": "high|medium|low"}}
+  ]
+}}
+
+Règles de classification:
+- important: factures, paiements, sécurité, urgences, réunions, contrats, mots de passe, alertes compte
+- newsletter: promotions, publicités, désabonnement, marketing, offres commerciales
+- normal: tout le reste (emails de collègues, notifications informatives, etc.)"""
+
+        import anthropic as _anthropic
+        client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        message = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        import json as _json_ai
+        raw = message.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        analysis = _json_ai.loads(raw)
+        return jsonify(analysis)
+
+    except Exception as e:
+        print(f"[AI] Erreur analyse: {e}")
+        return jsonify({"error": f"Erreur analyse IA: {str(e)}"}), 500
+
+
 @app.route('/api/stats')
 def get_stats():
     email = request.args.get('email', '').strip().lower()
@@ -1286,30 +1399,16 @@ def get_stats():
 
 @app.route('/api/user/whatsapp-qr', methods=['GET'])
 def get_whatsapp_qr():
-    email = request.args.get('email')
-    if not email:
-        return jsonify({"error": "email requis"}), 400
-    db = get_db()
+    if not GREEN_API_INSTANCE or not GREEN_API_TOKEN:
+        return jsonify({"error": "WhatsApp non configuré sur ce serveur"}), 503
+    url = f"{GREEN_API_URL}/waInstance{GREEN_API_INSTANCE}/qr/{GREEN_API_TOKEN}"
     try:
-        with db.cursor() as cur:
-            cur.execute(
-                "SELECT green_api_instance, green_api_token FROM users WHERE email = %s AND is_verified = 1",
-                (email,)
-            )
-            user = cur.fetchone()
-        if not user or not user.get('green_api_instance') or not user.get('green_api_token'):
-            return jsonify({"error": "Green API non configure pour cet utilisateur"}), 400
-        instance = user['green_api_instance']
-        token = user['green_api_token']
-        url = f"https://api.green-api.com/waInstance{instance}/qr/{token}"
         resp = requests.get(url, timeout=15)
         if not resp.ok:
             return jsonify({"error": f"Erreur Green API: {resp.status_code}"}), 502
         return jsonify(resp.json())
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-    finally:
-        _return_db(db)
 
 
 @app.route('/api/user/settings', methods=['GET'])
@@ -1369,39 +1468,22 @@ def update_user_settings():
             theme_secondary = _str(data.get('theme_secondary'), 20) or None
             if theme_mode and theme_mode not in ('light', 'dark'):
                 theme_mode = None
+            # COALESCE sur tous les champs critiques — un champ absent dans le body
+            # ne doit PAS écraser la valeur existante en base
+            def _val(key):
+                v = data.get(key)
+                return v if v not in (None, '') else None
+
             if app_password:
                 cur.execute(
                     """UPDATE users SET
-                        name = COALESCE(%s, name),
-                        phone = %s,
-                        gmail_address = %s,
-                        telegram_chat_id = %s,
-                        green_api_instance = %s,
-                        green_api_token = %s,
-                        app_password = %s,
-                        avatar = COALESCE(%s, avatar),
-                        theme_color      = COALESCE(%s, theme_color),
-                        font_family      = COALESCE(%s, font_family),
-                        theme_mode       = COALESCE(%s, theme_mode),
-                        theme_secondary  = COALESCE(%s, theme_secondary),
-                        theme_updated_at = CASE WHEN %s THEN NOW() ELSE theme_updated_at END
-                    WHERE email = %s AND is_verified = 1""",
-                    (name, data.get('phone'), data.get('gmail_address'),
-                     data.get('telegram_chat_id'), data.get('green_api_instance'),
-                     data.get('green_api_token'), app_password,
-                     avatar, theme_color, font_family, theme_mode, theme_secondary,
-                     bool(theme_color or font_family or theme_mode or theme_secondary),
-                     email)
-                )
-            else:
-                cur.execute(
-                    """UPDATE users SET
-                        name = COALESCE(%s, name),
-                        phone = %s,
-                        gmail_address = %s,
-                        telegram_chat_id = %s,
-                        green_api_instance = %s,
-                        green_api_token = %s,
+                        name             = COALESCE(%s, name),
+                        phone            = COALESCE(%s, phone),
+                        gmail_address    = COALESCE(%s, gmail_address),
+                        telegram_chat_id = COALESCE(%s, telegram_chat_id),
+                        green_api_instance = COALESCE(%s, green_api_instance),
+                        green_api_token  = COALESCE(%s, green_api_token),
+                        app_password     = %s,
                         avatar           = COALESCE(%s, avatar),
                         theme_color      = COALESCE(%s, theme_color),
                         font_family      = COALESCE(%s, font_family),
@@ -1409,9 +1491,32 @@ def update_user_settings():
                         theme_secondary  = COALESCE(%s, theme_secondary),
                         theme_updated_at = CASE WHEN %s THEN NOW() ELSE theme_updated_at END
                     WHERE email = %s AND is_verified = 1""",
-                    (name, data.get('phone'), data.get('gmail_address'),
-                     data.get('telegram_chat_id'), data.get('green_api_instance'),
-                     data.get('green_api_token'),
+                    (name, _val('phone'), _val('gmail_address'),
+                     _val('telegram_chat_id'), _val('green_api_instance'),
+                     _val('green_api_token'), app_password,
+                     avatar, theme_color, font_family, theme_mode, theme_secondary,
+                     bool(theme_color or font_family or theme_mode or theme_secondary),
+                     email)
+                )
+            else:
+                cur.execute(
+                    """UPDATE users SET
+                        name             = COALESCE(%s, name),
+                        phone            = COALESCE(%s, phone),
+                        gmail_address    = COALESCE(%s, gmail_address),
+                        telegram_chat_id = COALESCE(%s, telegram_chat_id),
+                        green_api_instance = COALESCE(%s, green_api_instance),
+                        green_api_token  = COALESCE(%s, green_api_token),
+                        avatar           = COALESCE(%s, avatar),
+                        theme_color      = COALESCE(%s, theme_color),
+                        font_family      = COALESCE(%s, font_family),
+                        theme_mode       = COALESCE(%s, theme_mode),
+                        theme_secondary  = COALESCE(%s, theme_secondary),
+                        theme_updated_at = CASE WHEN %s THEN NOW() ELSE theme_updated_at END
+                    WHERE email = %s AND is_verified = 1""",
+                    (name, _val('phone'), _val('gmail_address'),
+                     _val('telegram_chat_id'), _val('green_api_instance'),
+                     _val('green_api_token'),
                      avatar, theme_color, font_family, theme_mode, theme_secondary,
                      bool(theme_color or font_family or theme_mode or theme_secondary),
                      email)
@@ -1442,27 +1547,63 @@ def _send_fcm_notification(fcm_token: str, title: str, body: str):
         print(f"[FCM] Erreur push: {e}")
 
 
-def _send_whatsapp_notification(user, sender: str, subject: str, snippet: str):
-    instance = user.get('green_api_instance')
-    token    = user.get('green_api_token')
-    phone    = user.get('phone')
-    if not instance or not token or not phone:
+def _resolve_whatsapp_chat_id(phone_clean: str):
+    """
+    Résout le chatId WhatsApp correct pour un numéro.
+    Certains comptes WhatsApp utilisent @lid (nouveau format) au lieu de @c.us.
+    """
+    try:
+        url = f"{GREEN_API_URL}/waInstance{GREEN_API_INSTANCE}/checkWhatsapp/{GREEN_API_TOKEN}"
+        resp = requests.post(url, json={"phoneNumber": phone_clean}, timeout=10)
+        if resp.ok:
+            data = resp.json()
+            if data.get('existsWhatsapp'):
+                chat_id = data.get('chatId', '')
+                if chat_id:
+                    return chat_id
+                # Fallback @c.us si checkWhatsapp ne retourne pas de chatId
+                return f"{phone_clean}@c.us"
+    except Exception as e:
+        print(f"[Monitor] checkWhatsapp exception: {e}")
+    return None
+
+
+def _send_whatsapp_notification(user, sender: str, subject: str, snippet: str, category: str = 'normal'):
+    phone = user.get('phone')
+    if not phone or not GREEN_API_INSTANCE or not GREEN_API_TOKEN:
+        return
+    phone_clean = re.sub(r'\D', '', phone)
+    if not phone_clean:
         return
     match = re.match(r'^(.+?)\s*<', sender)
     sender_name = match.group(1).strip().strip('"') if match else sender.split('@')[0]
+    cat_labels = {'important': '🔴 Important', 'newsletter': '🟡 Newsletter', 'normal': '🔵 Normal'}
+    cat_label = cat_labels.get(category, '🔵 Normal')
     text = (
-        f"📧 *MailNotifier — Nouveau mail !*\n\n"
+        f"📬 *MailNotifier*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Nouveau mail — {cat_label}\n\n"
         f"*De :* {sender_name}\n"
         f"*Objet :* {subject}\n"
-        f"*Aperçu :* {snippet[:150]}"
+        f"*Aperçu :* {snippet[:150]}\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🔔 Consultez votre boîte mail."
     )
     try:
-        url = f"https://api.green-api.com/waInstance{instance}/sendMessage/{token}"
-        resp = requests.post(url, json={"chatId": f"{phone}@c.us", "message": text}, timeout=10)
+        # Préférer le chatId stocké en BDD (évite checkWhatsapp)
+        chat_id = user.get('whatsapp_chat_id') or _resolve_whatsapp_chat_id(phone_clean)
+        if not chat_id:
+            # Dernier recours : format standard
+            chat_id = f"{phone_clean}@c.us"
+        url = f"{GREEN_API_URL}/waInstance{GREEN_API_INSTANCE}/sendMessage/{GREEN_API_TOKEN}"
+        resp = requests.post(url, json={"chatId": chat_id, "message": text}, timeout=10)
         if resp.ok:
-            print(f"[Monitor] WhatsApp OK → {phone}")
+            print(f"[Monitor] WhatsApp OK → {phone_clean} (chatId={chat_id})")
+            # Sauvegarder le chatId en BDD si pas encore stocké
+            if not user.get('whatsapp_chat_id') and chat_id:
+                _save_whatsapp_chat_id(user.get('id'), chat_id)
         else:
-            print(f"[Monitor] WhatsApp erreur: {resp.status_code}")
+            print(f"[Monitor] WhatsApp erreur: {resp.status_code} {resp.text[:100]}")
     except Exception as e:
         print(f"[Monitor] WhatsApp exception: {e}")
 
@@ -1572,6 +1713,18 @@ def _save_last_uid(user_id, uid):
         _return_db(db)
 
 
+def _save_whatsapp_chat_id(user_id, chat_id: str):
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("UPDATE users SET whatsapp_chat_id=%s WHERE id=%s", (chat_id, user_id))
+        db.commit()
+    except Exception as e:
+        print(f"[Monitor] Erreur save whatsapp_chat_id: {e}")
+    finally:
+        _return_db(db)
+
+
 def _check_user_emails_gmail(user):
     """Vérifie les nouveaux mails d'un utilisateur via Gmail API (OAuth 2.0)."""
     user_email      = user['email']
@@ -1624,8 +1777,7 @@ def _check_user_emails_gmail(user):
                     if chat_id:
                         _send_telegram_notification(chat_id, sender, subject, snippet, user_email, category)
 
-                    if category == 'important':
-                        _send_whatsapp_notification(user, sender, subject, snippet)
+                    _send_whatsapp_notification(user, sender, subject, snippet, category)
 
                     match_s = re.match(r'^(.+?)\s*<', sender)
                     sender_name = match_s.group(1).strip().strip('"') if match_s else sender.split('@')[0]
@@ -1661,13 +1813,13 @@ def _check_all_users():
         with db.cursor() as cur:
             cur.execute("""
                 SELECT id, email, telegram_chat_id, last_history_id,
-                       fcm_token, phone, green_api_instance, green_api_token
+                       fcm_token, phone, whatsapp_chat_id
                 FROM users
                 WHERE gmail_refresh_token IS NOT NULL
                   AND (
                     (telegram_chat_id IS NOT NULL AND telegram_chat_id != '')
                     OR fcm_token IS NOT NULL
-                    OR green_api_instance IS NOT NULL
+                    OR (phone IS NOT NULL AND phone != '')
                   )
                   AND is_verified = 1
             """)
@@ -1684,6 +1836,78 @@ def _check_all_users():
             _check_user_emails_gmail(user)
         except Exception as e:
             print(f"[Monitor] Erreur user {user['email']}: {e}")
+
+
+@app.route('/api/whatsapp/test')
+def whatsapp_test():
+    """Endpoint de diagnostic WhatsApp — teste le flux complet pour un user."""
+    email = request.args.get('email', '').strip().lower()
+    logs  = []
+
+    logs.append(f"GREEN_API_URL      = {GREEN_API_URL}")
+    logs.append(f"GREEN_API_INSTANCE = {'SET' if GREEN_API_INSTANCE else 'MANQUANT'}")
+    logs.append(f"GREEN_API_TOKEN    = {'SET' if GREEN_API_TOKEN else 'MANQUANT'}")
+
+    if not GREEN_API_INSTANCE or not GREEN_API_TOKEN:
+        logs.append("ERREUR : variables GREEN_API non configurées sur Render !")
+        return jsonify({"logs": logs}), 503
+
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT phone, whatsapp_chat_id FROM users WHERE email = %s AND is_verified = 1", (email,))
+            row = cur.fetchone()
+    finally:
+        _return_db(db)
+
+    if not row:
+        logs.append(f"ERREUR: utilisateur {email} non trouvé")
+        return jsonify({"logs": logs}), 404
+
+    phone = (row.get('phone') or '').strip()
+    stored_chat_id = (row.get('whatsapp_chat_id') or '').strip()
+    logs.append(f"phone en BDD           = '{phone}'")
+    logs.append(f"whatsapp_chat_id en BDD = '{stored_chat_id}'")
+
+    if not phone:
+        logs.append("ERREUR : numéro de téléphone vide en BDD")
+        return jsonify({"logs": logs}), 400
+
+    phone_clean = re.sub(r'\D', '', phone)
+    logs.append(f"phone nettoyé          = '{phone_clean}'")
+
+    # Utiliser le chatId stocké si disponible, sinon tenter checkWhatsapp
+    if stored_chat_id:
+        chat_id = stored_chat_id
+        logs.append(f"chatId (BDD)           = {chat_id}")
+    else:
+        try:
+            check_url = f"{GREEN_API_URL}/waInstance{GREEN_API_INSTANCE}/checkWhatsapp/{GREEN_API_TOKEN}"
+            resp = requests.post(check_url, json={"phoneNumber": phone_clean}, timeout=10)
+            logs.append(f"checkWhatsapp HTTP     = {resp.status_code}")
+            if resp.ok and resp.text.strip():
+                cdata = resp.json()
+                logs.append(f"checkWhatsapp resp     = {cdata}")
+                chat_id = cdata.get('chatId', '') if cdata.get('existsWhatsapp') else f"{phone_clean}@c.us"
+            else:
+                chat_id = f"{phone_clean}@c.us"
+                logs.append(f"checkWhatsapp indispo (HTTP {resp.status_code}), fallback @c.us")
+        except Exception as e:
+            chat_id = f"{phone_clean}@c.us"
+            logs.append(f"checkWhatsapp exception: {e} — fallback @c.us")
+        logs.append(f"chatId résolu          = {chat_id}")
+
+    # Envoi message test
+    try:
+        send_url = f"{GREEN_API_URL}/waInstance{GREEN_API_INSTANCE}/sendMessage/{GREEN_API_TOKEN}"
+        payload  = {"chatId": chat_id, "message": "📬 *MailNotifier* — Test automatique WhatsApp réussi !"}
+        sresp    = requests.post(send_url, json=payload, timeout=10)
+        logs.append(f"sendMessage HTTP   = {sresp.status_code}")
+        logs.append(f"sendMessage resp   = {sresp.text[:200]}")
+    except Exception as e:
+        logs.append(f"ERREUR sendMessage : {e}")
+
+    return jsonify({"logs": logs})
 
 
 def monitor_emails_loop():
