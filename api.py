@@ -1876,6 +1876,19 @@ def whatsapp_test():
     phone_clean = re.sub(r'\D', '', phone)
     logs.append(f"phone nettoyé          = '{phone_clean}'")
 
+    # Toujours vérifier checkWhatsapp pour diagnostic (même si chatId déjà stocké)
+    try:
+        check_url = f"{GREEN_API_URL}/waInstance{GREEN_API_INSTANCE}/checkWhatsapp/{GREEN_API_TOKEN}"
+        cr = requests.post(check_url, json={"phoneNumber": phone_clean}, timeout=10)
+        logs.append(f"checkWhatsapp HTTP     = {cr.status_code}")
+        if cr.ok and cr.text.strip():
+            cd = cr.json()
+            logs.append(f"checkWhatsapp resp     = {cd}")
+        else:
+            logs.append(f"checkWhatsapp body vide (HTTP {cr.status_code})")
+    except Exception as ce:
+        logs.append(f"checkWhatsapp exception: {ce}")
+
     # Utiliser le chatId stocké si disponible, sinon tenter checkWhatsapp
     if stored_chat_id:
         chat_id = stored_chat_id
