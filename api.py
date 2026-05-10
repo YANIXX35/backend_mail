@@ -1900,10 +1900,12 @@ def whatsapp_test():
     # Envoi message test
     try:
         send_url = f"{GREEN_API_URL}/waInstance{GREEN_API_INSTANCE}/sendMessage/{GREEN_API_TOKEN}"
-        payload  = {"chatId": chat_id, "message": "📬 *MailNotifier* — Test automatique WhatsApp réussi !"}
+        token_preview = (GREEN_API_TOKEN or '')[:6] + '...' if GREEN_API_TOKEN else 'NONE'
+        logs.append(f"sendMessage URL    = {GREEN_API_URL}/waInstance{GREEN_API_INSTANCE}/sendMessage/{token_preview}")
+        payload  = {"chatId": chat_id, "message": "MailNotifier - Test automatique WhatsApp reussi !"}
         sresp    = requests.post(send_url, json=payload, timeout=10)
         logs.append(f"sendMessage HTTP   = {sresp.status_code}")
-        logs.append(f"sendMessage resp   = {sresp.text[:200]}")
+        logs.append(f"sendMessage resp   = {sresp.text[:300]}")
     except Exception as e:
         logs.append(f"ERREUR sendMessage : {e}")
 
