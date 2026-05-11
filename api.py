@@ -1,4 +1,4 @@
-print("=== MailNotifier API v4.1 - GMAIL OAUTH + FCM ===")
+print("=== MailNotifier API v4.3 - GMAIL OAUTH + FCM ===")
 import os
 import re
 import time
@@ -28,6 +28,25 @@ import psycopg2.extras
 import psycopg2.pool
 import bcrypt
 import jwt
+
+# ── CACHE MÉMOIRE (TTL simple, thread-safe) ────────────────────────────────────
+_cache: dict = {}
+_cache_lock  = threading.Lock()
+
+def _cache_get(key: str):
+    with _cache_lock:
+        entry = _cache.get(key)
+        if entry and time.time() < entry['exp']:
+            return entry['val']
+        return None
+
+def _cache_set(key: str, val, ttl: int):
+    with _cache_lock:
+        _cache[key] = {'val': val, 'exp': time.time() + ttl}
+
+def _cache_del(key: str):
+    with _cache_lock:
+        _cache.pop(key, None)
 from functools import wraps
 import firebase_admin
 from firebase_admin import credentials as fb_credentials, messaging as fb_messaging
@@ -1097,10 +1116,16 @@ def gmail_disconnect():
 
 @app.route('/api/gmail/status')
 def gmail_oauth_status():
-    """Retourne le statut de connexion OAuth Gmail de l'utilisateur."""
+    """Retourne le statut de connexion OAuth Gmail de l'utilisateur (cache 60s)."""
     email = request.args.get('email', '').strip().lower()
     if not email:
         return jsonify({'connected': False}), 400
+
+    cache_key = f"gmail_status:{email}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+
     db = get_db()
     try:
         with db.cursor() as cur:
@@ -1111,15 +1136,17 @@ def gmail_oauth_status():
             )
             row = cur.fetchone()
         if not row or not row.get('gmail_refresh_token'):
-            return jsonify({'connected': False, 'gmail_email': None, 'expired': False})
-
-        expiry  = row.get('gmail_token_expiry')
-        expired = bool(expiry and int(time.time()) > expiry)
-        return jsonify({
-            'connected':   True,
-            'gmail_email': row.get('gmail_connected_email'),
-            'expired':     expired,
-        })
+            result = {'connected': False, 'gmail_email': None, 'expired': False}
+        else:
+            expiry  = row.get('gmail_token_expiry')
+            expired = bool(expiry and int(time.time()) > expiry)
+            result  = {
+                'connected':   True,
+                'gmail_email': row.get('gmail_connected_email'),
+                'expired':     expired,
+            }
+        _cache_set(cache_key, result, ttl=60)
+        return jsonify(result)
     finally:
         _return_db(db)
 
@@ -1385,6 +1412,12 @@ def get_stats():
     email = request.args.get('email', '').strip().lower()
     if not email:
         return jsonify({"total_messages": 0, "unread_count": 0, "email": email})
+
+    cache_key = f"stats:{email}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+
     try:
         service = _get_gmail_service(email)
         if not service:
@@ -1398,7 +1431,9 @@ def get_stats():
         ).execute()
         unread = unread_res.get('resultSizeEstimate', 0)
 
-        return jsonify({"total_messages": total, "unread_count": unread, "email": email})
+        result = {"total_messages": total, "unread_count": unread, "email": email}
+        _cache_set(cache_key, result, ttl=30)
+        return jsonify(result)
     except Exception as e:
         print(f"[ERROR] get_stats: {e}")
         return jsonify({"total_messages": 0, "unread_count": 0, "email": email})
@@ -2536,6 +2571,23 @@ def chat_bot():
         return jsonify({'response': "Desole, erreur momentanee. Reessaie dans un instant !"}), 200
 
 
+def _self_ping_loop():
+    """Ping /api/version toutes les 10 min pour garder Render éveillé."""
+    time.sleep(60)   # laisse le serveur finir son boot
+    base_url = os.getenv('RENDER_EXTERNAL_URL', '')
+    if not base_url:
+        print("[PING] RENDER_EXTERNAL_URL non défini — self-ping désactivé")
+        return
+    url = f"{base_url.rstrip('/')}/api/version"
+    while True:
+        try:
+            r = requests.get(url, timeout=10)
+            print(f"[PING] self-ping → {r.status_code}")
+        except Exception as e:
+            print(f"[PING] self-ping error: {e}")
+        time.sleep(600)   # 10 minutes
+
+
 def _startup():
     # Skip startup in test environment (avoids real DB connections and daemon threads)
     if os.getenv('TESTING'):
@@ -2549,6 +2601,8 @@ def _startup():
         threading.Thread(target=telegram_bot_polling, daemon=True, name="tg-bot").start()
         print("[STARTUP] Lancement thread email-monitor...")
         threading.Thread(target=monitor_emails_loop, daemon=True, name="email-monitor").start()
+        print("[STARTUP] Lancement thread self-ping (anti-sleep Render)...")
+        threading.Thread(target=_self_ping_loop, daemon=True, name="self-ping").start()
         print("[STARTUP] Tous les threads lances avec succes.")
     except Exception as e:
         import traceback
