@@ -80,8 +80,8 @@ class AnonymousUserTasks(TaskSet):
             "email":    random_email(),
             "password": "TestPass123!",
         }
-        with self.client.post("/api/register", json=payload,
-                              name="POST /api/register", catch_response=True) as r:
+        with self.client.post("/api/auth/register", json=payload,
+                              name="POST /api/auth/register", catch_response=True) as r:
             # 200/201 = inscrit, 409 = déjà pris, 422 = validation = tous OK
             if r.status_code in (200, 201, 409, 422):
                 r.success()
@@ -115,10 +115,10 @@ class AuthenticatedUserTasks(TaskSet):
     def on_start(self):
         """Login au démarrage, stocke le token."""
         try:
-            resp = self.client.post("/api/login", json={
+            resp = self.client.post("/api/auth/login", json={
                 "email":    TEST_USER_EMAIL,
                 "password": TEST_USER_PASSWORD,
-            }, name="POST /api/login (setup)")
+            }, name="POST /api/auth/login (setup)")
             if resp.status_code == 200:
                 data = resp.json()
                 self.token = data.get("token") or data.get("access_token")

@@ -1312,6 +1312,12 @@ def ai_analyze():
     if not GEMINI_API_KEY:
         return jsonify({"error": "GEMINI_API_KEY manquant"}), 503
 
+    # Cache 5 min — évite les 429 Gemini sous charge
+    cache_key = f"ai_analyze:{email}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+
     try:
         service = _get_gmail_service(email)
         if not service:
@@ -1400,6 +1406,7 @@ Règles de classification:
             if raw.startswith("json"):
                 raw = raw[4:]
         analysis = _json_ai.loads(raw)
+        _cache_set(cache_key, analysis, ttl=300)   # 5 min
         return jsonify(analysis)
 
     except Exception as e:
