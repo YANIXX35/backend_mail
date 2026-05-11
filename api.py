@@ -1281,9 +1281,9 @@ def ai_analyze():
     if not email:
         return jsonify({"error": "email requis"}), 400
 
-    ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
-    if not ANTHROPIC_API_KEY:
-        return jsonify({"error": "ANTHROPIC_API_KEY manquant"}), 503
+    GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+    if not GEMINI_API_KEY:
+        return jsonify({"error": "GEMINI_API_KEY manquant"}), 503
 
     try:
         service = _get_gmail_service(email)
@@ -1351,16 +1351,23 @@ Règles de classification:
 - newsletter: promotions, publicités, désabonnement, marketing, offres commerciales
 - normal: tout le reste (emails de collègues, notifications informatives, etc.)"""
 
-        import anthropic as _anthropic
-        client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        message = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}]
+        url = (
+            'https://generativelanguage.googleapis.com/v1beta/models/'
+            f'gemini-2.5-flash-lite:generateContent?key={GEMINI_API_KEY}'
         )
+        resp = requests.post(
+            url,
+            headers={'Content-Type': 'application/json'},
+            json={
+                'contents': [{'role': 'user', 'parts': [{'text': prompt}]}],
+                'generationConfig': {'maxOutputTokens': 1500, 'temperature': 0.2},
+            },
+            timeout=(5, 25),
+        )
+        resp.raise_for_status()
 
         import json as _json_ai
-        raw = message.content[0].text.strip()
+        raw = resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
