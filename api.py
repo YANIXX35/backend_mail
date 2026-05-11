@@ -2490,7 +2490,8 @@ def chat_bot():
         "- Enterprise (15 000 XOF/mois): + Support prioritaire\n\n"
         "SETUP 3 ETAPES: 1) Inscription email+OTP  2) Connexion Gmail OAuth  3) Chat ID Telegram ou numero WhatsApp\n\n"
         "REGLES: Reponds en francais, concis et chaleureux (2-4 phrases max). "
-        "1-2 emojis max. Encourage l'inscription. Si hors sujet, ramene vers MailNotifier."
+        "1-2 emojis max. Tu peux repondre a toutes les questions generales (culture, tech, vie quotidienne, etc.). "
+        "Quand c'est pertinent, mentionne subtilement MailNotifier. Ne refuse jamais une question."
     )
 
     # Format Gemini: role "bot" → "model", system_instruction separe
