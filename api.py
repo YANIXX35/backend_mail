@@ -2516,7 +2516,7 @@ def chat_bot():
                 'max_tokens': 250,
                 'temperature': 0.7,
             },
-            timeout=20,
+            timeout=(5, 15),  # 5s connexion, 15s lecture
         )
         resp.raise_for_status()
         text = resp.json()['choices'][0]['message']['content'].strip()
