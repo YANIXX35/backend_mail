@@ -1291,7 +1291,7 @@ def ai_analyze():
             return jsonify({"error": "Gmail non connecté"}), 403
 
         result = service.users().messages().list(
-            userId='me', labelIds=['INBOX'], maxResults=15
+            userId='me', labelIds=['INBOX'], maxResults=10
         ).execute()
         msg_ids = [m['id'] for m in result.get('messages', [])]
 
@@ -1362,7 +1362,7 @@ Règles de classification:
                 'contents': [{'role': 'user', 'parts': [{'text': prompt}]}],
                 'generationConfig': {'maxOutputTokens': 1500, 'temperature': 0.2},
             },
-            timeout=(5, 25),
+            timeout=(5, 45),
         )
         resp.raise_for_status()
 
