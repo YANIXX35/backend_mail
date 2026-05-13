@@ -390,6 +390,7 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_chat_id VARCHAR(80)")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_enabled BOOLEAN DEFAULT TRUE")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_enabled BOOLEAN DEFAULT TRUE")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_send_scope BOOLEAN DEFAULT FALSE")
             # Pré-remplir le chatId @lid connu pour kyliyanisse (checkWhatsapp retourne 404 sur ce serveur)
             cur.execute("""
                 UPDATE users SET whatsapp_chat_id='62508954075303@lid'
@@ -1118,13 +1119,18 @@ def gmail_oauth_callback():
         db = get_db()
         try:
             with db.cursor() as cur:
+                # Vérifier si le scope gmail.send est inclus dans les scopes accordés
+                granted_scopes = getattr(creds, 'scopes', None) or []
+                has_send_scope = any('gmail.send' in s for s in granted_scopes)
+
                 cur.execute(
                     """UPDATE users SET
                         gmail_access_token    = %s,
                         gmail_refresh_token   = %s,
                         gmail_token_expiry    = %s,
                         gmail_connected_email = %s,
-                        gmail_address = COALESCE(NULLIF(gmail_address,''), %s)
+                        gmail_address = COALESCE(NULLIF(gmail_address,''), %s),
+                        gmail_send_scope = %s
                     WHERE email = %s AND is_verified = 1""",
                     (
                         creds.token,
@@ -1132,6 +1138,7 @@ def gmail_oauth_callback():
                         int(creds.expiry.timestamp()) if creds.expiry else None,
                         gmail_email,
                         gmail_email,
+                        has_send_scope,
                         user_email,
                     ),
                 )
@@ -1189,7 +1196,8 @@ def gmail_oauth_status():
     try:
         with db.cursor() as cur:
             cur.execute(
-                "SELECT gmail_access_token, gmail_refresh_token, gmail_connected_email, gmail_token_expiry "
+                "SELECT gmail_refresh_token, gmail_connected_email, gmail_token_expiry, "
+                "COALESCE(gmail_send_scope, FALSE) as gmail_send_scope "
                 "FROM users WHERE email = %s",
                 (email,),
             )
@@ -1199,42 +1207,11 @@ def gmail_oauth_status():
         else:
             expiry  = row.get('gmail_token_expiry')
             expired = bool(expiry and int(time.time()) > expiry)
-
-            # Vérifier si le token a le scope gmail.send (via tokeninfo Google)
-            can_send = False
-            access_token = row.get('gmail_access_token')
-            if access_token:
-                try:
-                    tr = requests.get(
-                        'https://oauth2.googleapis.com/tokeninfo',
-                        params={'access_token': access_token},
-                        timeout=4,
-                    )
-                    if tr.ok:
-                        can_send = 'gmail.send' in tr.json().get('scope', '')
-                    elif tr.status_code == 400:
-                        # Token expiré — on tente un refresh pour obtenir le scope réel
-                        svc = _get_gmail_service(email)
-                        if svc:
-                            with db.cursor() as cur2:
-                                cur2.execute("SELECT gmail_access_token FROM users WHERE email=%s", (email,))
-                                refreshed = cur2.fetchone()
-                            if refreshed and refreshed.get('gmail_access_token'):
-                                tr2 = requests.get(
-                                    'https://oauth2.googleapis.com/tokeninfo',
-                                    params={'access_token': refreshed['gmail_access_token']},
-                                    timeout=4,
-                                )
-                                if tr2.ok:
-                                    can_send = 'gmail.send' in tr2.json().get('scope', '')
-                except Exception:
-                    can_send = True  # en cas d'erreur réseau, on ne bloque pas l'utilisateur
-
-            result = {
+            result  = {
                 'connected':   True,
                 'gmail_email': row.get('gmail_connected_email'),
                 'expired':     expired,
-                'can_send':    can_send,
+                'can_send':    bool(row.get('gmail_send_scope', False)),
             }
         _cache_set(cache_key, result, ttl=60)
         return jsonify(result)
