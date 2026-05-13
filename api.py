@@ -391,6 +391,9 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_enabled BOOLEAN DEFAULT TRUE")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_enabled BOOLEAN DEFAULT TRUE")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_send_scope BOOLEAN DEFAULT FALSE")
+            # v2 scope flag — nouvelle colonne propre qui part à FALSE pour tous (y compris les
+            # utilisateurs existants dont gmail_send_scope était déjà TRUE par erreur).
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_scope_v2 BOOLEAN DEFAULT FALSE")
             # Pré-remplir le chatId @lid connu pour kyliyanisse (checkWhatsapp retourne 404 sur ce serveur)
             cur.execute("""
                 UPDATE users SET whatsapp_chat_id='62508954075303@lid'
@@ -1130,7 +1133,8 @@ def gmail_oauth_callback():
                         gmail_token_expiry    = %s,
                         gmail_connected_email = %s,
                         gmail_address = COALESCE(NULLIF(gmail_address,''), %s),
-                        gmail_send_scope = %s
+                        gmail_send_scope = %s,
+                        gmail_scope_v2   = %s
                     WHERE email = %s AND is_verified = 1""",
                     (
                         creds.token,
@@ -1138,6 +1142,7 @@ def gmail_oauth_callback():
                         int(creds.expiry.timestamp()) if creds.expiry else None,
                         gmail_email,
                         gmail_email,
+                        has_send_scope,
                         has_send_scope,
                         user_email,
                     ),
@@ -1197,7 +1202,7 @@ def gmail_oauth_status():
         with db.cursor() as cur:
             cur.execute(
                 "SELECT gmail_refresh_token, gmail_connected_email, gmail_token_expiry, "
-                "COALESCE(gmail_send_scope, FALSE) as gmail_send_scope "
+                "COALESCE(gmail_scope_v2, FALSE) as gmail_scope_v2 "
                 "FROM users WHERE email = %s",
                 (email,),
             )
@@ -1211,7 +1216,7 @@ def gmail_oauth_status():
                 'connected':   True,
                 'gmail_email': row.get('gmail_connected_email'),
                 'expired':     expired,
-                'can_send':    bool(row.get('gmail_send_scope', False)),
+                'can_send':    bool(row.get('gmail_scope_v2', False)),
             }
         _cache_set(cache_key, result, ttl=60)
         return jsonify(result)
