@@ -1631,8 +1631,8 @@ Règles de classification:
 - normal: tout le reste (emails de collègues, notifications informatives, etc.)"""
 
         GEMINI_MODELS = [
-            'gemini-2.0-flash-lite',
-            'gemini-1.5-flash',
+            'gemini-2.0-flash',
+            'gemini-2.5-flash-lite',
         ]
 
         import json as _json_ai
@@ -2936,31 +2936,35 @@ def chat_bot():
             contents.append({'role': 'model', 'parts': [{'text': content}]})
     contents.append({'role': 'user', 'parts': [{'text': message}]})
 
-    url = (
-        'https://generativelanguage.googleapis.com/v1beta/models/'
-        f'gemini-2.5-flash-lite:generateContent?key={GEMINI_API_KEY}'
-    )
-
-    try:
-        resp = requests.post(
-            url,
-            headers={'Content-Type': 'application/json'},
-            json={
-                'system_instruction': {'parts': [{'text': system_prompt}]},
-                'contents': contents,
-                'generationConfig': {'maxOutputTokens': 250, 'temperature': 0.7},
-            },
-            timeout=(5, 20),
+    chat_models = ['gemini-2.0-flash', 'gemini-2.5-flash-lite']
+    last_chat_err = None
+    for chat_model in chat_models:
+        url = (
+            'https://generativelanguage.googleapis.com/v1beta/models/'
+            f'{chat_model}:generateContent?key={GEMINI_API_KEY}'
         )
-        resp.raise_for_status()
-        text = resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-        return jsonify({'response': text})
-    except Exception as e:
-        print(f"[Chat] Erreur Gemini: {e}")
-        # Capture Sentry uniquement pour les vraies erreurs (pas les 429 attendus)
-        if _sentry_dsn and '429' not in str(e) and 'timeout' not in str(e).lower():
-            sentry_sdk.capture_exception(e)
-        return jsonify({'response': "Desole, erreur momentanee. Reessaie dans un instant !"}), 200
+        try:
+            resp = requests.post(
+                url,
+                headers={'Content-Type': 'application/json'},
+                json={
+                    'system_instruction': {'parts': [{'text': system_prompt}]},
+                    'contents': contents,
+                    'generationConfig': {'maxOutputTokens': 250, 'temperature': 0.7},
+                },
+                timeout=(5, 20),
+            )
+            resp.raise_for_status()
+            text = resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+            return jsonify({'response': text})
+        except Exception as e:
+            print(f"[Chat] Erreur Gemini ({chat_model}): {e}")
+            last_chat_err = e
+            continue
+
+    if _sentry_dsn and last_chat_err and '429' not in str(last_chat_err) and 'timeout' not in str(last_chat_err).lower():
+        sentry_sdk.capture_exception(last_chat_err)
+    return jsonify({'response': "Desole, erreur momentanee. Reessaie dans un instant !"}), 200
 
 
 def _send_weekly_summary_to_user(user: dict):
