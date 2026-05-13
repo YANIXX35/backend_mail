@@ -856,6 +856,8 @@ def admin_get_users():
                 SELECT id, name, email, is_verified, role, plan, phone,
                        gmail_address, telegram_chat_id, green_api_instance,
                        CASE WHEN app_password IS NOT NULL THEN TRUE ELSE FALSE END as gmail_connected,
+                       CASE WHEN gmail_refresh_token IS NOT NULL THEN TRUE ELSE FALSE END as gmail_oauth_connected,
+                       COALESCE(gmail_scope_v2, FALSE) as gmail_scope_v2,
                        CASE WHEN last_history_id IS NOT NULL THEN TRUE ELSE FALSE END as monitor_active,
                        created_at
                 FROM users ORDER BY created_at DESC
@@ -972,6 +974,56 @@ def admin_delete_payment(pay_id):
             cur.execute("DELETE FROM payments WHERE id=%s", (pay_id,))
         db.commit()
         return jsonify({'message': 'Paiement supprime'}), 200
+    finally:
+        _return_db(db)
+
+
+@app.route('/api/admin/gmail-scope-status', methods=['GET'])
+def admin_gmail_scope_status():
+    """Liste tous les utilisateurs avec Gmail OAuth connecté + leur statut de scope v2."""
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                SELECT email, name,
+                       COALESCE(gmail_scope_v2, FALSE) as has_scope,
+                       gmail_connected_email
+                FROM users
+                WHERE gmail_refresh_token IS NOT NULL
+                ORDER BY has_scope ASC, name ASC
+            """)
+            rows = [dict(r) for r in cur.fetchall()]
+        return jsonify({'users': rows, 'total': len(rows),
+                        'upgraded': sum(1 for r in rows if r['has_scope']),
+                        'pending':  sum(1 for r in rows if not r['has_scope'])}), 200
+    finally:
+        _return_db(db)
+
+
+@app.route('/api/admin/reset-gmail-scope', methods=['POST'])
+def admin_reset_gmail_scope():
+    """Remet gmail_scope_v2=FALSE pour forcer la reconnexion (pour 1 user ou tous)."""
+    data = request.json or {}
+    target = data.get('email', 'all').strip().lower()
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            if target == 'all':
+                cur.execute("UPDATE users SET gmail_scope_v2 = FALSE WHERE gmail_refresh_token IS NOT NULL")
+            else:
+                cur.execute("UPDATE users SET gmail_scope_v2 = FALSE WHERE email = %s", (target,))
+            count = cur.rowcount
+        db.commit()
+        # Invalider le cache pour les utilisateurs concernés
+        if target == 'all':
+            with _cache_lock:
+                keys_to_del = [k for k in _cache if k.startswith('gmail_status:')]
+                for k in keys_to_del:
+                    _cache.pop(k, None)
+        else:
+            with _cache_lock:
+                _cache.pop(f'gmail_status:{target}', None)
+        return jsonify({'success': True, 'reset_count': count}), 200
     finally:
         _return_db(db)
 
