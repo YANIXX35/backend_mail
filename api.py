@@ -1645,12 +1645,20 @@ def whatsapp_webhook():
             return jsonify({'status': 'ignored'}), 200
 
         msg_data = data.get('messageData', {})
-        if msg_data.get('typeMessage') != 'textMessage':
+        msg_type = msg_data.get('typeMessage', '')
+
+        # Extraire le texte selon le type (textMessage ou extendedTextMessage)
+        if msg_type == 'textMessage':
+            reply_text = msg_data.get('textMessageData', {}).get('textMessage', '').strip()
+        elif msg_type == 'extendedTextMessage':
+            reply_text = msg_data.get('extendedTextMessageData', {}).get('text', '').strip()
+        else:
             return jsonify({'status': 'not_text'}), 200
 
-        reply_text = msg_data.get('textMessageData', {}).get('textMessage', '').strip()
         if not reply_text:
             return jsonify({'status': 'empty'}), 200
+
+        print(f"[WEBHOOK] Texte extrait: '{reply_text[:60]}' | type={msg_type}")
 
         # Pour message sortant : chatId = destinataire du message envoyé
         # Pour message entrant : chatId = l'expéditeur
