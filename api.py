@@ -1634,7 +1634,10 @@ def whatsapp_webhook():
         data         = request.get_json(silent=True) or {}
         type_webhook = data.get('typeWebhook', '')
 
-        if type_webhook != 'incomingMessageReceived':
+        # Accepter messages entrants ET sortants (commandes tapées par l'utilisateur depuis son propre WA)
+        is_incoming = type_webhook == 'incomingMessageReceived'
+        is_outgoing = type_webhook == 'outgoingMessageReceived'
+        if not is_incoming and not is_outgoing:
             return jsonify({'status': 'ignored'}), 200
 
         msg_data = data.get('messageData', {})
@@ -1645,7 +1648,15 @@ def whatsapp_webhook():
         if not reply_text:
             return jsonify({'status': 'empty'}), 200
 
-        sender_chat_id = data.get('senderData', {}).get('chatId', '')
+        # Pour message sortant : chatId = destinataire du message envoyé
+        # Pour message entrant : chatId = l'expéditeur
+        sender_data = data.get('senderData', {})
+        sender_chat_id = sender_data.get('chatId', '')
+
+        # Si message sortant (l'utilisateur a tapé une commande depuis son WA),
+        # on répond dans ce même chat
+        if is_outgoing and not reply_text.startswith('!'):
+            return jsonify({'status': 'ignored_outgoing'}), 200
 
         # ── Identifier l'utilisateur propriétaire de cette instance Green API ──
         # On cherche par chat_id d'abord, puis par instance/token si nécessaire
