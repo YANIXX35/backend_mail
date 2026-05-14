@@ -1517,6 +1517,10 @@ def whatsapp_webhook():
         if not reply_text:
             return jsonify({'status': 'empty'}), 200
 
+        # Si l'utilisateur a tapé un numéro de template (1-6), on l'étend
+        if reply_text in WA_REPLY_TEMPLATES:
+            reply_text = WA_REPLY_TEMPLATES[reply_text]
+
         # On ne traite que les réponses à une notif (quotedMessage présent)
         quoted = msg_data.get('quotedMessage')
         if not quoted:
@@ -2060,6 +2064,15 @@ def _resolve_whatsapp_chat_id(phone_clean: str):
     return None
 
 
+WA_REPLY_TEMPLATES = {
+    '1': 'Bonjour,\n\nMerci pour votre message.\n\nCordialement,',
+    '2': 'Bonjour,\n\nBien reçu, je reviens vers vous rapidement.\n\nCordialement,',
+    '3': 'Bonjour,\n\nMerci pour votre message. Je traite votre demande et reviens vers vous très prochainement.\n\nCordialement,',
+    '4': 'Bonjour,\n\nJe confirme notre rendez-vous. N\'hésitez pas à me contacter si vous avez des questions.\n\nCordialement,',
+    '5': 'Bonjour,\n\nJe suis actuellement absent et reviendrai prochainement. Je prendrai en compte votre message à mon retour.\n\nCordialement,',
+    '6': 'Bonjour,\n\nMerci pour votre message. Après réflexion, je ne suis malheureusement pas en mesure de donner suite à votre demande.\n\nCordialement,',
+}
+
 def _send_whatsapp_notification(user, sender: str, subject: str, snippet: str, category: str = 'normal', gmail_message_id: str = ''):
     phone = user.get('phone')
     if not phone or not GREEN_API_INSTANCE or not GREEN_API_TOKEN:
@@ -2079,7 +2092,15 @@ def _send_whatsapp_notification(user, sender: str, subject: str, snippet: str, c
         f"*Objet :* {subject}\n"
         f"*Aperçu :* {snippet[:150]}\n\n"
         f"------------------\n"
-        f"💬 Répondez à ce message WhatsApp pour répondre directement par email."
+        f"💬 *Répondez à ce message pour répondre par email.*\n\n"
+        f"*Réponses rapides — tapez le numéro :*\n"
+        f"1️⃣  OK, merci !\n"
+        f"2️⃣  Bien reçu, je reviens rapidement.\n"
+        f"3️⃣  Je traite votre demande.\n"
+        f"4️⃣  Je confirme notre rendez-vous.\n"
+        f"5️⃣  Je suis absent.\n"
+        f"6️⃣  Refus poli.\n"
+        f"✏️  Ou écrivez votre réponse personnalisée."
     )
     try:
         # Préférer le chatId stocké en BDD (évite checkWhatsapp)
