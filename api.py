@@ -1654,10 +1654,6 @@ def whatsapp_webhook():
 
         # Debug : log tout ce qui arrive au webhook
         print(f"[WEBHOOK] typeWebhook={type_webhook} | msgType={data.get('messageData',{}).get('typeMessage')} | text={data.get('messageData',{}).get('textMessageData',{}).get('textMessage','')[:50]} | chatId={data.get('senderData',{}).get('chatId','')}")
-        # Debug complet pour quotedMessage
-        if data.get('messageData', {}).get('typeMessage') == 'quotedMessage':
-            import json as _json_dbg
-            print(f"[WEBHOOK-DEBUG] messageData={_json_dbg.dumps(data.get('messageData', {}))}")
 
         # Accepter messages entrants ET sortants + outgoingApiMessageReceived
         is_incoming = type_webhook == 'incomingMessageReceived'
