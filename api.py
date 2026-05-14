@@ -431,6 +431,26 @@ def init_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS wa_templates (
+                    id SERIAL PRIMARY KEY,
+                    user_email VARCHAR(150) NOT NULL,
+                    name VARCHAR(100) NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            # Stocker le contexte de la dernière notif WhatsApp par utilisateur
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS wa_context (
+                    user_email VARCHAR(150) PRIMARY KEY,
+                    last_gmail_msg_id VARCHAR(100),
+                    last_sender VARCHAR(300),
+                    last_subject VARCHAR(500),
+                    last_snippet TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
         db.commit()
         print("Tables verifiees/creees avec succes.")
     finally:
@@ -1499,9 +1519,117 @@ def reply_email():
         return jsonify({'error': f'Erreur envoi: {str(e)}'}), 500
 
 
+# ─── TEMPLATES WHATSAPP ───────────────────────────────────────────────────────
+
+@app.route('/api/templates', methods=['GET'])
+@token_required
+def get_templates():
+    """Liste les templates personnalisés de l'utilisateur + les templates par défaut."""
+    user_email = request.user_email
+    custom = _get_user_templates(user_email)
+    defaults = [
+        {'id': None, 'name': 'OK, merci !', 'content': WA_REPLY_TEMPLATES['1'], 'is_default': True, 'key': '1'},
+        {'id': None, 'name': 'Bien reçu, je reviens.', 'content': WA_REPLY_TEMPLATES['2'], 'is_default': True, 'key': '2'},
+        {'id': None, 'name': 'Je traite votre demande.', 'content': WA_REPLY_TEMPLATES['3'], 'is_default': True, 'key': '3'},
+        {'id': None, 'name': 'Je confirme notre rendez-vous.', 'content': WA_REPLY_TEMPLATES['4'], 'is_default': True, 'key': '4'},
+        {'id': None, 'name': 'Je suis absent.', 'content': WA_REPLY_TEMPLATES['5'], 'is_default': True, 'key': '5'},
+        {'id': None, 'name': 'Refus poli.', 'content': WA_REPLY_TEMPLATES['6'], 'is_default': True, 'key': '6'},
+    ]
+    for t in custom:
+        t['is_default'] = False
+    return jsonify({'defaults': defaults, 'custom': custom}), 200
+
+
+@app.route('/api/templates', methods=['POST'])
+@token_required
+def create_template():
+    """Crée un template personnalisé."""
+    user_email = request.user_email
+    body = request.get_json(silent=True) or {}
+    name = _str(body.get('name', ''), 100)
+    content = _str(body.get('content', ''), 2000)
+    if not name:
+        return jsonify({'error': 'Nom requis'}), 400
+    if not content:
+        return jsonify({'error': 'Contenu requis'}), 400
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM wa_templates WHERE user_email=%s",
+                (user_email,)
+            )
+            row = cur.fetchone()
+            if row and list(row.values())[0] >= 20:
+                return jsonify({'error': 'Maximum 20 templates atteint'}), 400
+            cur.execute(
+                "INSERT INTO wa_templates (user_email, name, content) VALUES (%s, %s, %s) RETURNING id",
+                (user_email, name, content)
+            )
+            new_id = cur.fetchone()['id']
+        db.commit()
+        return jsonify({'id': new_id, 'name': name, 'content': content, 'is_default': False}), 201
+    except Exception as e:
+        print(f"[Templates] create error: {e}")
+        return jsonify({'error': 'Erreur création'}), 500
+    finally:
+        _return_db(db)
+
+
+@app.route('/api/templates/<int:template_id>', methods=['PUT'])
+@token_required
+def update_template(template_id: int):
+    """Met à jour un template personnalisé."""
+    user_email = request.user_email
+    body = request.get_json(silent=True) or {}
+    name = _str(body.get('name', ''), 100)
+    content = _str(body.get('content', ''), 2000)
+    if not name or not content:
+        return jsonify({'error': 'Nom et contenu requis'}), 400
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "UPDATE wa_templates SET name=%s, content=%s WHERE id=%s AND user_email=%s",
+                (name, content, template_id, user_email)
+            )
+            if cur.rowcount == 0:
+                return jsonify({'error': 'Template introuvable'}), 404
+        db.commit()
+        return jsonify({'success': True}), 200
+    except Exception as e:
+        print(f"[Templates] update error: {e}")
+        return jsonify({'error': 'Erreur mise à jour'}), 500
+    finally:
+        _return_db(db)
+
+
+@app.route('/api/templates/<int:template_id>', methods=['DELETE'])
+@token_required
+def delete_template(template_id: int):
+    """Supprime un template personnalisé."""
+    user_email = request.user_email
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "DELETE FROM wa_templates WHERE id=%s AND user_email=%s",
+                (template_id, user_email)
+            )
+            if cur.rowcount == 0:
+                return jsonify({'error': 'Template introuvable'}), 404
+        db.commit()
+        return jsonify({'success': True}), 200
+    except Exception as e:
+        print(f"[Templates] delete error: {e}")
+        return jsonify({'error': 'Erreur suppression'}), 500
+    finally:
+        _return_db(db)
+
+
 @app.route('/api/whatsapp/webhook', methods=['POST'])
 def whatsapp_webhook():
-    """Webhook Green API — l'utilisateur répond à une notif WhatsApp → on envoie le reply Gmail."""
+    """Webhook Green API — commandes + réponse à email via WhatsApp."""
     try:
         data         = request.get_json(silent=True) or {}
         type_webhook = data.get('typeWebhook', '')
@@ -1517,45 +1645,103 @@ def whatsapp_webhook():
         if not reply_text:
             return jsonify({'status': 'empty'}), 200
 
-        # Si l'utilisateur a tapé un numéro de template (1-6), on l'étend
-        if reply_text in WA_REPLY_TEMPLATES:
-            reply_text = WA_REPLY_TEMPLATES[reply_text]
+        sender_chat_id = data.get('senderData', {}).get('chatId', '')
 
-        # On ne traite que les réponses à une notif (quotedMessage présent)
-        quoted = msg_data.get('quotedMessage')
-        if not quoted:
-            return jsonify({'status': 'not_a_reply'}), 200
-
-        original_wa_msg_id = quoted.get('stanzaId', '')
-        if not original_wa_msg_id:
-            return jsonify({'status': 'no_stanza_id'}), 200
-
-        # Retrouver l'email Gmail correspondant
-        db  = get_db()
-        row = None
+        # ── Identifier l'utilisateur propriétaire de cette instance Green API ──
+        # On cherche par chat_id d'abord, puis par instance/token si nécessaire
+        wa_user_email = None
+        db = get_db()
         try:
             with db.cursor() as cur:
-                cur.execute(
-                    "SELECT user_email, gmail_message_id FROM whatsapp_email_map WHERE wa_msg_id=%s",
-                    (original_wa_msg_id,)
-                )
-                row = cur.fetchone()
+                if sender_chat_id:
+                    cur.execute(
+                        "SELECT email FROM users WHERE whatsapp_chat_id=%s AND is_verified=1 LIMIT 1",
+                        (sender_chat_id,)
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        wa_user_email = row['email']
+                if not wa_user_email:
+                    # Fallback : chercher par instance Green API partagée → admin
+                    cur.execute(
+                        "SELECT email FROM users WHERE role='admin' AND is_verified=1 LIMIT 1"
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        wa_user_email = row['email']
         finally:
             _return_db(db)
 
-        if not row:
+        # ── Commandes ! ────────────────────────────────────────────────────────
+        if reply_text.startswith('!') and sender_chat_id and wa_user_email:
+            handled = _handle_wa_command(reply_text, wa_user_email, sender_chat_id)
+            if handled:
+                return jsonify({'status': 'command_handled'}), 200
+
+        # ── Résoudre templates numériques (1-6 défaut + 7-10 custom) ──────────
+        quoted = msg_data.get('quotedMessage')
+        original_wa_msg_id = (quoted or {}).get('stanzaId', '')
+
+        # Chercher le mapping pour retrouver user_email + gmail_message_id
+        mapping_row = None
+        if original_wa_msg_id:
+            db = get_db()
+            try:
+                with db.cursor() as cur:
+                    cur.execute(
+                        "SELECT user_email, gmail_message_id FROM whatsapp_email_map WHERE wa_msg_id=%s",
+                        (original_wa_msg_id,)
+                    )
+                    mapping_row = cur.fetchone()
+            finally:
+                _return_db(db)
+
+        # Résoudre user_email définitif (depuis mapping si dispo, sinon wa_user_email)
+        user_email = (mapping_row['user_email'] if mapping_row else None) or wa_user_email
+
+        # Expansion des templates (1-6 défaut, 7+ custom)
+        if reply_text.isdigit():
+            num = int(reply_text)
+            if num in range(1, 7) and reply_text in WA_REPLY_TEMPLATES:
+                # Template défaut — on applique variables après avoir récupéré le contexte
+                ctx = _get_wa_context(user_email) if user_email else {}
+                match_s = re.match(r'^(.+?)\s*<', ctx.get('last_sender', ''))
+                sname = match_s.group(1).strip().strip('"') if match_s else (ctx.get('last_sender', '') or '').split('@')[0]
+                reply_text = _expand_template_vars(
+                    WA_REPLY_TEMPLATES[reply_text],
+                    sender_name=sname,
+                    subject=ctx.get('last_subject', '')
+                )
+            elif num >= 7 and user_email:
+                custom = _get_user_templates(user_email)
+                idx = num - 7
+                if 0 <= idx < len(custom):
+                    ctx = _get_wa_context(user_email)
+                    match_s = re.match(r'^(.+?)\s*<', ctx.get('last_sender', ''))
+                    sname = match_s.group(1).strip().strip('"') if match_s else (ctx.get('last_sender', '') or '').split('@')[0]
+                    reply_text = _expand_template_vars(
+                        custom[idx]['content'],
+                        sender_name=sname,
+                        subject=ctx.get('last_subject', '')
+                    )
+
+        # ── Besoin d'un quoted message pour envoyer le reply Gmail ────────────
+        if not original_wa_msg_id:
+            # Pas de quote : si c'est une commande, déjà traitée ; sinon, ignorer
+            return jsonify({'status': 'not_a_reply'}), 200
+
+        if not mapping_row:
             print(f"[WEBHOOK] Aucun mapping pour wa_msg_id={original_wa_msg_id}")
             return jsonify({'status': 'no_mapping'}), 200
 
-        user_email       = row['user_email']
-        gmail_message_id = row['gmail_message_id']
+        gmail_message_id = mapping_row['gmail_message_id']
 
         service = _get_gmail_service(user_email)
         if not service:
             print(f"[WEBHOOK] Gmail non connecté pour {user_email}")
             return jsonify({'status': 'gmail_not_connected'}), 200
 
-        orig  = service.users().messages().get(
+        orig = service.users().messages().get(
             userId='me', id=gmail_message_id, format='metadata',
             metadataHeaders=['Subject', 'From', 'Message-ID', 'References']
         ).execute()
@@ -1564,10 +1750,16 @@ def whatsapp_webhook():
         subject   = hdrs.get('Subject', '')
         if not subject.lower().startswith('re:'):
             subject = f'Re: {subject}'
-        to_addr      = hdrs.get('From', '')
-        orig_msg_id  = hdrs.get('Message-ID', '')
+        to_addr       = hdrs.get('From', '')
+        orig_msg_id   = hdrs.get('Message-ID', '')
         existing_refs = hdrs.get('References', '')
-        references   = (f'{existing_refs} {orig_msg_id}').strip() if orig_msg_id else existing_refs
+        references    = (f'{existing_refs} {orig_msg_id}').strip() if orig_msg_id else existing_refs
+
+        # Substitution des variables si pas encore faite (réponse libre avec {…})
+        if '{' in reply_text:
+            match_s = re.match(r'^(.+?)\s*<', to_addr)
+            sname = match_s.group(1).strip().strip('"') if match_s else to_addr.split('@')[0]
+            reply_text = _expand_template_vars(reply_text, sender_name=sname, subject=hdrs.get('Subject', ''))
 
         msg = MIMEText(reply_text, 'plain', 'utf-8')
         msg['To']      = to_addr
@@ -1585,17 +1777,9 @@ def whatsapp_webhook():
 
         print(f"[WEBHOOK] Reply WhatsApp envoyé → {to_addr} pour {user_email}")
 
-        # Confirmation WhatsApp à l'expéditeur
-        sender_chat_id = data.get('senderData', {}).get('chatId', '')
-        if sender_chat_id and GREEN_API_INSTANCE and GREEN_API_TOKEN:
-            try:
-                confirm_url = f"{GREEN_API_URL}/waInstance{GREEN_API_INSTANCE}/sendMessage/{GREEN_API_TOKEN}"
-                requests.post(confirm_url, json={
-                    "chatId": sender_chat_id,
-                    "message": f"✅ Réponse envoyée à {to_addr} !"
-                }, timeout=10)
-            except Exception:
-                pass
+        # Confirmation WhatsApp
+        if sender_chat_id:
+            _send_wa_message(sender_chat_id, f"✅ Réponse envoyée à {to_addr} !")
 
         return jsonify({'status': 'reply_sent'}), 200
 
@@ -2073,6 +2257,229 @@ WA_REPLY_TEMPLATES = {
     '6': 'Bonjour,\n\nMerci pour votre message. Après réflexion, je ne suis malheureusement pas en mesure de donner suite à votre demande.\n\nCordialement,',
 }
 
+def _send_wa_message(chat_id: str, message: str) -> bool:
+    """Envoie un message WhatsApp via Green API. Retourne True si succès."""
+    if not GREEN_API_INSTANCE or not GREEN_API_TOKEN or not chat_id:
+        return False
+    try:
+        url = f"{GREEN_API_URL}/waInstance{GREEN_API_INSTANCE}/sendMessage/{GREEN_API_TOKEN}"
+        resp = requests.post(url, json={"chatId": chat_id, "message": message}, timeout=10)
+        return resp.ok
+    except Exception as e:
+        print(f"[WA] send exception: {e}")
+        return False
+
+
+def _expand_template_vars(text: str, sender_name: str = '', subject: str = '') -> str:
+    """Remplace les variables dans un template : {prénom}, {nom}, {date}, {objet}."""
+    today = datetime.now().strftime('%d/%m/%Y')
+    first_name = sender_name.split()[0] if sender_name else sender_name
+    text = text.replace('{prénom}', first_name)
+    text = text.replace('{prenom}', first_name)
+    text = text.replace('{nom}', sender_name)
+    text = text.replace('{date}', today)
+    text = text.replace('{objet}', subject)
+    return text
+
+
+def _get_user_templates(user_email: str) -> list:
+    """Récupère les templates personnalisés d'un utilisateur."""
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT id, name, content FROM wa_templates WHERE user_email=%s ORDER BY id ASC",
+                (user_email,)
+            )
+            return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[Templates] get error: {e}")
+        return []
+    finally:
+        _return_db(db)
+
+
+def _get_wa_context(user_email: str) -> dict:
+    """Récupère le contexte du dernier mail notifié pour cet utilisateur."""
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT last_gmail_msg_id, last_sender, last_subject, last_snippet FROM wa_context WHERE user_email=%s",
+                (user_email,)
+            )
+            row = cur.fetchone()
+            return dict(row) if row else {}
+    except Exception:
+        return {}
+    finally:
+        _return_db(db)
+
+
+def _set_wa_context(user_email: str, gmail_msg_id: str, sender: str, subject: str, snippet: str):
+    """Stocke le contexte du dernier mail notifié pour pouvoir répondre sans quote."""
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                INSERT INTO wa_context (user_email, last_gmail_msg_id, last_sender, last_subject, last_snippet, updated_at)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (user_email) DO UPDATE SET
+                    last_gmail_msg_id=%s, last_sender=%s, last_subject=%s, last_snippet=%s, updated_at=NOW()
+            """, (user_email, gmail_msg_id, sender, subject, snippet,
+                  gmail_msg_id, sender, subject, snippet))
+        db.commit()
+    except Exception as e:
+        print(f"[WA context] set error: {e}")
+    finally:
+        _return_db(db)
+
+
+def _handle_wa_command(cmd: str, user_email: str, chat_id: str) -> bool:
+    """
+    Gère les commandes WhatsApp qui commencent par !
+    Retourne True si une commande a été traitée.
+    """
+    cmd_lower = cmd.lower().strip()
+
+    if cmd_lower in ('!aide', '!help', '!sos'):
+        msg = (
+            "*🤖 MailNotifier — Commandes disponibles*\n\n"
+            "📩 *Répondre à un email :*\n"
+            "  → Répondez directement à une notification\n"
+            "  → Ou tapez un numéro (1-6) pour un template rapide\n\n"
+            "🗂️ *Commandes :*\n"
+            "  `!aide` — Afficher cette aide\n"
+            "  `!templates` — Voir tous vos templates\n"
+            "  `!statut` — Statut de votre boîte mail\n"
+            "  `!dernier` — Infos sur le dernier mail reçu\n"
+            "  `!smart` — Suggestions de réponse IA pour le dernier mail\n\n"
+            "✏️ *Variables dans vos templates :*\n"
+            "  `{prénom}` `{nom}` `{date}` `{objet}`"
+        )
+        _send_wa_message(chat_id, msg)
+        return True
+
+    if cmd_lower in ('!templates', '!template', '!modeles'):
+        custom = _get_user_templates(user_email)
+        lines = ["*📋 Templates de réponse rapide :*\n"]
+        lines.append("*Défauts :*")
+        defaults = {
+            '1': 'OK, merci !',
+            '2': 'Bien reçu, je reviens rapidement.',
+            '3': 'Je traite votre demande.',
+            '4': 'Je confirme notre rendez-vous.',
+            '5': 'Je suis absent.',
+            '6': 'Refus poli.',
+        }
+        for k, v in defaults.items():
+            lines.append(f"  {k}️⃣  {v}")
+        if custom:
+            lines.append("\n*Personnalisés :*")
+            for i, t in enumerate(custom, 7):
+                lines.append(f"  `{i}` — {t['name']}")
+            lines.append("\n_(Tapez le numéro pour utiliser)_")
+        else:
+            lines.append("\n_Ajoutez des templates personnalisés depuis le tableau de bord._")
+        _send_wa_message(chat_id, '\n'.join(lines))
+        return True
+
+    if cmd_lower in ('!statut', '!status', '!stats'):
+        ctx = _get_wa_context(user_email)
+        db = get_db()
+        try:
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) as cnt FROM whatsapp_email_map WHERE user_email=%s AND created_at > NOW() - INTERVAL '24 hours'",
+                    (user_email,)
+                )
+                row = cur.fetchone()
+                count = row['cnt'] if row else 0
+        except Exception:
+            count = 0
+        finally:
+            _return_db(db)
+        last_info = ''
+        if ctx.get('last_sender'):
+            match = re.match(r'^(.+?)\s*<', ctx['last_sender'])
+            sname = match.group(1).strip().strip('"') if match else ctx['last_sender'].split('@')[0]
+            last_info = f"\n📬 *Dernier mail :* {sname} — _{ctx.get('last_subject','')[:60]}_"
+        msg = (
+            f"*📊 Statut MailNotifier*\n\n"
+            f"📩 *Notifications aujourd'hui :* {count}\n"
+            f"{last_info}"
+        )
+        _send_wa_message(chat_id, msg)
+        return True
+
+    if cmd_lower in ('!dernier', '!last', '!recent'):
+        ctx = _get_wa_context(user_email)
+        if not ctx.get('last_sender'):
+            _send_wa_message(chat_id, "❌ Aucun mail récent dans le contexte.\n_Attendez une nouvelle notification._")
+        else:
+            match = re.match(r'^(.+?)\s*<', ctx['last_sender'])
+            sname = match.group(1).strip().strip('"') if match else ctx['last_sender'].split('@')[0]
+            msg = (
+                f"📬 *Dernier mail reçu :*\n\n"
+                f"*De :* {sname}\n"
+                f"*Objet :* {ctx.get('last_subject','')}\n"
+                f"*Aperçu :* {(ctx.get('last_snippet','') or '')[:200]}\n\n"
+                f"_Répondez directement à la notification pour envoyer un email._\n"
+                f"_Ou tapez `!smart` pour une suggestion IA._"
+            )
+            _send_wa_message(chat_id, msg)
+        return True
+
+    if cmd_lower in ('!smart', '!ia', '!ai'):
+        ctx = _get_wa_context(user_email)
+        if not ctx.get('last_gmail_msg_id'):
+            _send_wa_message(chat_id, "❌ Aucun contexte de mail disponible. Attendez une notification.")
+            return True
+        _send_wa_message(chat_id, "🤖 Génération de suggestions IA en cours...")
+        suggestions = _get_smart_reply_suggestions(user_email, ctx)
+        if suggestions:
+            _send_wa_message(chat_id, suggestions)
+        else:
+            _send_wa_message(chat_id, "❌ Impossible de générer des suggestions IA pour le moment.")
+        return True
+
+    return False
+
+
+def _get_smart_reply_suggestions(user_email: str, ctx: dict) -> str:
+    """Utilise Gemini pour générer 3 suggestions de réponse basées sur le dernier email."""
+    GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+    if not GEMINI_API_KEY:
+        return ''
+    sender = ctx.get('last_sender', '')
+    subject = ctx.get('last_subject', '')
+    snippet = ctx.get('last_snippet', '')
+    match = re.match(r'^(.+?)\s*<', sender)
+    sender_name = match.group(1).strip().strip('"') if match else sender.split('@')[0]
+    prompt = (
+        f"Tu es un assistant email professionnel. "
+        f"Voici un email reçu :\n"
+        f"De : {sender_name}\n"
+        f"Objet : {subject}\n"
+        f"Contenu : {snippet[:500]}\n\n"
+        f"Génère exactement 3 suggestions de réponse courtes (2-3 phrases max chacune), "
+        f"professionnelles et en français. "
+        f"Format : numérote chaque suggestion (1., 2., 3.) sans entête ni explication."
+    )
+    models = ['gemini-2.0-flash', 'gemini-2.5-flash-lite']
+    for model in models:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+            body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 400}}
+            resp = requests.post(url, json=body, timeout=20)
+            if resp.ok:
+                text = resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+                return f"🤖 *Suggestions de réponse IA :*\n\n{text}\n\n_Répondez à la notification avec votre réponse._"
+        except Exception as e:
+            print(f"[SmartReply] {model} error: {e}")
+    return ''
+
+
 def _send_whatsapp_notification(user, sender: str, subject: str, snippet: str, category: str = 'normal', gmail_message_id: str = ''):
     phone = user.get('phone')
     if not phone or not GREEN_API_INSTANCE or not GREEN_API_TOKEN:
@@ -2084,6 +2491,16 @@ def _send_whatsapp_notification(user, sender: str, subject: str, snippet: str, c
     sender_name = match.group(1).strip().strip('"') if match else sender.split('@')[0]
     cat_labels = {'important': '🔴 Important', 'newsletter': '📢 Newsletter', 'normal': '✉️ Normal'}
     cat_label = cat_labels.get(category, '✉️ Normal')
+
+    # Récupérer templates personnalisés pour les afficher aussi
+    custom_tpls = _get_user_templates(user.get('email', ''))
+    custom_lines = ''
+    if custom_tpls:
+        lines = []
+        for i, t in enumerate(custom_tpls[:4], 7):
+            lines.append(f"{i}️⃣  {t['name']}")
+        custom_lines = '\n' + '\n'.join(lines)
+
     text = (
         f"*MailNotifier*\n"
         f"------------------\n"
@@ -2099,8 +2516,10 @@ def _send_whatsapp_notification(user, sender: str, subject: str, snippet: str, c
         f"3️⃣  Je traite votre demande.\n"
         f"4️⃣  Je confirme notre rendez-vous.\n"
         f"5️⃣  Je suis absent.\n"
-        f"6️⃣  Refus poli.\n"
-        f"✏️  Ou écrivez votre réponse personnalisée."
+        f"6️⃣  Refus poli."
+        f"{custom_lines}\n"
+        f"✏️  Ou écrivez votre réponse personnalisée.\n"
+        f"💡 Tapez `!aide` pour les commandes avancées."
     )
     try:
         # Préférer le chatId stocké en BDD (évite checkWhatsapp)
@@ -2120,6 +2539,9 @@ def _send_whatsapp_notification(user, sender: str, subject: str, snippet: str, c
                 wa_msg_id = resp.json().get('idMessage', '')
                 if wa_msg_id:
                     _store_whatsapp_email_map(wa_msg_id, user.get('email', ''), gmail_message_id)
+            # Mémoriser le contexte de ce mail pour les commandes !dernier / !smart
+            if gmail_message_id:
+                _set_wa_context(user.get('email', ''), gmail_message_id, sender, subject, snippet)
         else:
             print(f"[Monitor] WhatsApp erreur: {resp.status_code} {resp.text[:100]}")
     except Exception as e:
