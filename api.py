@@ -451,6 +451,24 @@ def init_db():
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Conversations conversationnelles — remplace whatsapp_email_map
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS wa_conversations (
+                    id SERIAL PRIMARY KEY,
+                    user_email VARCHAR(150) NOT NULL,
+                    gmail_thread_id VARCHAR(100),
+                    gmail_message_id VARCHAR(100) NOT NULL,
+                    recipient_email VARCHAR(300),
+                    recipient_name VARCHAR(200),
+                    subject VARCHAR(500),
+                    wa_message_id VARCHAR(100) UNIQUE,
+                    conversation_state VARCHAR(20) DEFAULT 'active',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_wa_conv_wa_msg ON wa_conversations(wa_message_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_wa_conv_user ON wa_conversations(user_email)")
         db.commit()
         print("Tables verifiees/creees avec succes.")
     finally:
@@ -2513,72 +2531,101 @@ def _get_smart_reply_suggestions(user_email: str, ctx: dict) -> str:
     return ''
 
 
-def _send_whatsapp_notification(user, sender: str, subject: str, snippet: str, category: str = 'normal', gmail_message_id: str = ''):
+def _send_whatsapp_notification(user, sender: str, subject: str, snippet: str,
+                                category: str = 'normal', gmail_message_id: str = '',
+                                gmail_thread_id: str = ''):
     phone = user.get('phone')
     if not phone or not GREEN_API_INSTANCE or not GREEN_API_TOKEN:
         return
     phone_clean = re.sub(r'\D', '', phone)
     if not phone_clean:
         return
-    match = re.match(r'^(.+?)\s*<', sender)
-    sender_name = match.group(1).strip().strip('"') if match else sender.split('@')[0]
-    cat_labels = {'important': '🔴 Important', 'newsletter': '📢 Newsletter', 'normal': '✉️ Normal'}
-    cat_label = cat_labels.get(category, '✉️ Normal')
 
-    # Récupérer templates personnalisés pour les afficher aussi
-    custom_tpls = _get_user_templates(user.get('email', ''))
-    custom_lines = ''
-    if custom_tpls:
-        lines = []
-        for i, t in enumerate(custom_tpls[:4], 7):
-            lines.append(f"{i}️⃣  {t['name']}")
-        custom_lines = '\n' + '\n'.join(lines)
+    match = re.match(r'^(.+?)\s*<(.+?)>', sender)
+    sender_name  = match.group(1).strip().strip('"') if match else sender.split('@')[0]
+    sender_email = match.group(2).strip() if match else sender
 
+    cat_icons = {'important': '🔴', 'newsletter': '📢', 'normal': '📩'}
+    cat_icon  = cat_icons.get(category, '📩')
+
+    now_str = datetime.now().strftime('%H:%M')
+
+    # ── Nouveau format conversationnel moderne ─────────────────────────────────
     text = (
-        f"*MailNotifier*\n"
-        f"------------------\n"
-        f"Nouveau mail — {cat_label}\n\n"
-        f"*De :* {sender_name}\n"
-        f"*Objet :* {subject}\n"
-        f"*Aperçu :* {snippet[:150]}\n\n"
-        f"------------------\n"
-        f"💬 *Répondez à ce message pour répondre par email.*\n\n"
-        f"*Réponses rapides — tapez le numéro :*\n"
-        f"1️⃣  OK, merci !\n"
-        f"2️⃣  Bien reçu, je reviens rapidement.\n"
-        f"3️⃣  Je traite votre demande.\n"
-        f"4️⃣  Je confirme notre rendez-vous.\n"
-        f"5️⃣  Je suis absent.\n"
-        f"6️⃣  Refus poli."
-        f"{custom_lines}\n"
-        f"✏️  Ou écrivez votre réponse personnalisée.\n"
-        f"💡 Tapez `!aide` pour les commandes avancées."
+        f"━━━━━━━━━━━━━━━\n"
+        f"{cat_icon} *{sender_name}*\n\n"
+        f"📝 {subject}\n"
+        f"🕒 Aujourd'hui {now_str}\n\n"
+        f"{snippet[:300]}\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"✍️ *Répondez directement à CE message*\n"
+        f"Votre réponse sera envoyée par email."
     )
+
     try:
-        # Préférer le chatId stocké en BDD (évite checkWhatsapp)
         chat_id = user.get('whatsapp_chat_id') or _resolve_whatsapp_chat_id(phone_clean)
         if not chat_id:
-            # Dernier recours : format standard
             chat_id = f"{phone_clean}@c.us"
-        url = f"{GREEN_API_URL}/waInstance{GREEN_API_INSTANCE}/sendMessage/{GREEN_API_TOKEN}"
+
+        url  = f"{GREEN_API_URL}/waInstance{GREEN_API_INSTANCE}/sendMessage/{GREEN_API_TOKEN}"
         resp = requests.post(url, json={"chatId": chat_id, "message": text}, timeout=10)
+
         if resp.ok:
             print(f"[Monitor] WhatsApp OK → {phone_clean} (chatId={chat_id})")
-            # Sauvegarder le chatId en BDD si pas encore stocké
             if not user.get('whatsapp_chat_id') and chat_id:
                 _save_whatsapp_chat_id(user.get('id'), chat_id)
-            # Stocker le mapping wa_msg_id → gmail_message_id pour le webhook reply
-            if gmail_message_id:
-                wa_msg_id = resp.json().get('idMessage', '')
-                if wa_msg_id:
-                    _store_whatsapp_email_map(wa_msg_id, user.get('email', ''), gmail_message_id)
-            # Mémoriser le contexte de ce mail pour les commandes !dernier / !smart
-            if gmail_message_id:
+
+            wa_msg_id = resp.json().get('idMessage', '')
+            if wa_msg_id and gmail_message_id:
+                _store_whatsapp_email_map(
+                    wa_msg_id, user.get('email', ''), gmail_message_id,
+                    gmail_thread_id=gmail_thread_id,
+                    recipient_email=sender_email,
+                    recipient_name=sender_name,
+                    subject=subject
+                )
                 _set_wa_context(user.get('email', ''), gmail_message_id, sender, subject, snippet)
+
+            # ── Suggestions IA automatiques (envoyées juste après la notif) ──
+            threading.Thread(
+                target=_send_ai_suggestions_wa,
+                args=(chat_id, user.get('email', ''), sender_name, subject, snippet),
+                daemon=True
+            ).start()
         else:
             print(f"[Monitor] WhatsApp erreur: {resp.status_code} {resp.text[:100]}")
     except Exception as e:
         print(f"[Monitor] WhatsApp exception: {e}")
+
+
+def _send_ai_suggestions_wa(chat_id: str, user_email: str, sender_name: str, subject: str, snippet: str):
+    """Génère et envoie 3 suggestions IA après la notification, de façon asynchrone."""
+    import time as _time
+    _time.sleep(1)  # Laisser la notification arriver en premier
+    GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+    if not GEMINI_API_KEY:
+        return
+    prompt = (
+        f"Email reçu de {sender_name}, objet: {subject}\n"
+        f"Contenu: {snippet[:400]}\n\n"
+        f"Génère exactement 3 réponses EMAIL très courtes (1 phrase max chacune), "
+        f"professionnelles, en français. "
+        f"Format strict — 3 lignes numérotées, rien d'autre:\n"
+        f"1. [réponse]\n2. [réponse]\n3. [réponse]"
+    )
+    models = ['gemini-2.0-flash', 'gemini-2.5-flash-lite']
+    for model in models:
+        try:
+            url  = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+            body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 200}}
+            resp = requests.post(url, json=body, timeout=15)
+            if resp.ok:
+                text = resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+                msg  = f"💡 *Suggestions de réponse :*\n\n{text}\n\n_Répondez directement à la notification ci-dessus._"
+                _send_wa_message(chat_id, msg)
+                return
+        except Exception as e:
+            print(f"[AI Suggestions] {model} error: {e}")
 
 
 _NEWSLETTER_KEYWORDS = [
@@ -2698,18 +2745,30 @@ def _save_whatsapp_chat_id(user_id, chat_id: str):
         _return_db(db)
 
 
-def _store_whatsapp_email_map(wa_msg_id: str, user_email: str, gmail_message_id: str):
+def _store_whatsapp_email_map(wa_msg_id: str, user_email: str, gmail_message_id: str,
+                              gmail_thread_id: str = '', recipient_email: str = '',
+                              recipient_name: str = '', subject: str = ''):
     db = get_db()
     try:
         with db.cursor() as cur:
+            # Maintenir la compatibilité avec l'ancienne table
             cur.execute(
                 """INSERT INTO whatsapp_email_map (wa_msg_id, user_email, gmail_message_id)
                    VALUES (%s, %s, %s) ON CONFLICT (wa_msg_id) DO NOTHING""",
                 (wa_msg_id, user_email, gmail_message_id)
             )
+            # Écrire aussi dans wa_conversations (nouveau système)
+            cur.execute("""
+                INSERT INTO wa_conversations
+                    (user_email, gmail_thread_id, gmail_message_id, recipient_email,
+                     recipient_name, subject, wa_message_id, conversation_state)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'active')
+                ON CONFLICT (wa_message_id) DO NOTHING
+            """, (user_email, gmail_thread_id, gmail_message_id,
+                  recipient_email, recipient_name, subject, wa_msg_id))
         db.commit()
     except Exception as e:
-        print(f"[Monitor] Erreur store whatsapp_email_map: {e}")
+        print(f"[Monitor] Erreur store whatsapp map: {e}")
     finally:
         _return_db(db)
 
@@ -2767,7 +2826,9 @@ def _check_user_emails_gmail(user):
                         _send_telegram_notification(chat_id, sender, subject, snippet, user_email, category)
 
                     if user.get('whatsapp_enabled', True):
-                        _send_whatsapp_notification(user, sender, subject, snippet, category, gmail_message_id=msg_id)
+                        thread_id = msg.get('threadId', '')
+                        _send_whatsapp_notification(user, sender, subject, snippet, category,
+                                                    gmail_message_id=msg_id, gmail_thread_id=thread_id)
 
                     match_s = re.match(r'^(.+?)\s*<', sender)
                     sender_name = match_s.group(1).strip().strip('"') if match_s else sender.split('@')[0]
