@@ -1687,11 +1687,14 @@ def whatsapp_webhook():
                 if not wa_user_email:
                     # Fallback : chercher par instance Green API partagée → admin
                     cur.execute(
-                        "SELECT email FROM users WHERE role='admin' AND is_verified=1 LIMIT 1"
+                        "SELECT email, whatsapp_chat_id FROM users WHERE role='admin' AND is_verified=1 LIMIT 1"
                     )
                     row = cur.fetchone()
                     if row:
                         wa_user_email = row['email']
+                        # Utiliser le chatId stocké en BDD (format @lid) pour pouvoir répondre
+                        if row.get('whatsapp_chat_id'):
+                            sender_chat_id = row['whatsapp_chat_id']
         finally:
             _return_db(db)
 
