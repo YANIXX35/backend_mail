@@ -1654,6 +1654,10 @@ def whatsapp_webhook():
 
         # Debug : log tout ce qui arrive au webhook
         print(f"[WEBHOOK] typeWebhook={type_webhook} | msgType={data.get('messageData',{}).get('typeMessage')} | text={data.get('messageData',{}).get('textMessageData',{}).get('textMessage','')[:50]} | chatId={data.get('senderData',{}).get('chatId','')}")
+        # Debug complet pour quotedMessage
+        if data.get('messageData', {}).get('typeMessage') == 'quotedMessage':
+            import json as _json_dbg
+            print(f"[WEBHOOK-DEBUG] messageData={_json_dbg.dumps(data.get('messageData', {}))}")
 
         # Accepter messages entrants ET sortants + outgoingApiMessageReceived
         is_incoming = type_webhook == 'incomingMessageReceived'
@@ -1665,10 +1669,10 @@ def whatsapp_webhook():
         msg_data = data.get('messageData', {})
         msg_type = msg_data.get('typeMessage', '')
 
-        # Extraire le texte selon le type (textMessage ou extendedTextMessage)
+        # Extraire le texte selon le type (textMessage, extendedTextMessage, ou quotedMessage)
         if msg_type == 'textMessage':
             reply_text = msg_data.get('textMessageData', {}).get('textMessage', '').strip()
-        elif msg_type == 'extendedTextMessage':
+        elif msg_type in ('extendedTextMessage', 'quotedMessage'):
             reply_text = msg_data.get('extendedTextMessageData', {}).get('text', '').strip()
         else:
             return jsonify({'status': 'not_text'}), 200
