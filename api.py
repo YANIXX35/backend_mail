@@ -1074,8 +1074,10 @@ def _get_gmail_service(user_email: str):
         token_uri='https://oauth2.googleapis.com/token',
         client_id=GOOGLE_CLIENT_ID,
         client_secret=GOOGLE_CLIENT_SECRET,
-        scopes=GMAIL_SCOPES,
         expiry=expiry_dt,
+        # Ne pas passer scopes ici : si on envoie gmail.send dans la requête de
+        # refresh mais que le token n'a que gmail.readonly, Google retourne
+        # invalid_scope. Sans scopes, Google accorde les scopes d'origine du token.
     )
 
     if not creds.valid:
