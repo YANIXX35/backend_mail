@@ -1634,10 +1634,14 @@ def whatsapp_webhook():
         data         = request.get_json(silent=True) or {}
         type_webhook = data.get('typeWebhook', '')
 
-        # Accepter messages entrants ET sortants (commandes tapées par l'utilisateur depuis son propre WA)
+        # Debug : log tout ce qui arrive au webhook
+        print(f"[WEBHOOK] typeWebhook={type_webhook} | msgType={data.get('messageData',{}).get('typeMessage')} | text={data.get('messageData',{}).get('textMessageData',{}).get('textMessage','')[:50]} | chatId={data.get('senderData',{}).get('chatId','')}")
+
+        # Accepter messages entrants ET sortants + outgoingApiMessageReceived
         is_incoming = type_webhook == 'incomingMessageReceived'
-        is_outgoing = type_webhook == 'outgoingMessageReceived'
+        is_outgoing = type_webhook in ('outgoingMessageReceived', 'outgoingApiMessageReceived')
         if not is_incoming and not is_outgoing:
+            print(f"[WEBHOOK] Ignoré — typeWebhook non géré: {type_webhook}")
             return jsonify({'status': 'ignored'}), 200
 
         msg_data = data.get('messageData', {})
@@ -1684,10 +1688,15 @@ def whatsapp_webhook():
             _return_db(db)
 
         # ── Commandes ! ────────────────────────────────────────────────────────
-        if reply_text.startswith('!') and sender_chat_id and wa_user_email:
-            handled = _handle_wa_command(reply_text, wa_user_email, sender_chat_id)
-            if handled:
-                return jsonify({'status': 'command_handled'}), 200
+        if reply_text.startswith('!'):
+            print(f"[WEBHOOK] Commande détectée: '{reply_text}' | chat_id={sender_chat_id} | user={wa_user_email}")
+            if sender_chat_id and wa_user_email:
+                handled = _handle_wa_command(reply_text, wa_user_email, sender_chat_id)
+                print(f"[WEBHOOK] Commande traitée: {handled}")
+                if handled:
+                    return jsonify({'status': 'command_handled'}), 200
+            else:
+                print(f"[WEBHOOK] Commande ignorée — chat_id ou user_email manquant")
 
         # ── Résoudre templates numériques (1-6 défaut + 7-10 custom) ──────────
         quoted = msg_data.get('quotedMessage')
@@ -2271,10 +2280,12 @@ WA_REPLY_TEMPLATES = {
 def _send_wa_message(chat_id: str, message: str) -> bool:
     """Envoie un message WhatsApp via Green API. Retourne True si succès."""
     if not GREEN_API_INSTANCE or not GREEN_API_TOKEN or not chat_id:
+        print(f"[WA] send ignoré — instance={GREEN_API_INSTANCE} token={'ok' if GREEN_API_TOKEN else 'vide'} chat_id={chat_id}")
         return False
     try:
         url = f"{GREEN_API_URL}/waInstance{GREEN_API_INSTANCE}/sendMessage/{GREEN_API_TOKEN}"
-        resp = requests.post(url, json={"chatId": chat_id, "message": message}, timeout=10)
+        resp = requests.post(url, json={"chatId": chat_id, "message": message[:500]}, timeout=10)
+        print(f"[WA] sendMessage → {chat_id} | status={resp.status_code} | ok={resp.ok}")
         return resp.ok
     except Exception as e:
         print(f"[WA] send exception: {e}")
