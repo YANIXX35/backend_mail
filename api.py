@@ -387,6 +387,7 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_token_expiry   BIGINT")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_connected_email VARCHAR(150)")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN DEFAULT FALSE")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_chat_id VARCHAR(80)")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_enabled BOOLEAN DEFAULT TRUE")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_enabled BOOLEAN DEFAULT TRUE")
@@ -1014,6 +1015,74 @@ def admin_delete_payment(pay_id):
         return jsonify({'message': 'Paiement supprime'}), 200
     finally:
         _return_db(db)
+
+
+@app.route('/api/admin/users/<int:user_id>/suspend', methods=['PATCH'])
+def admin_suspend_user(user_id):
+    data = request.json or {}
+    suspended = bool(data.get('is_suspended', False))
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("UPDATE users SET is_suspended=%s WHERE id=%s", (suspended, user_id))
+        db.commit()
+        action = 'suspendu' if suspended else 'reactive'
+        return jsonify({'message': f'Utilisateur {action}'}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        _return_db(db)
+
+
+@app.route('/api/admin/users/<path:email>/emails', methods=['GET'])
+def admin_get_user_emails(email):
+    """Recupere les emails Gmail d'un utilisateur specifique (acces admin)."""
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT gmail_token, gmail_address FROM users WHERE email=%s", (email,))
+            row = cur.fetchone()
+        if not row or not row.get('gmail_token'):
+            return jsonify({'emails': [], 'error': 'Gmail non connecte pour cet utilisateur'}), 200
+        token_data = row['gmail_token']
+    finally:
+        _return_db(db)
+    try:
+        import json as _j
+        creds_dict = _j.loads(token_data)
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        from googleapiclient.discovery import build
+        creds = Credentials(
+            token=creds_dict.get('token'),
+            refresh_token=creds_dict.get('refresh_token'),
+            token_uri='https://oauth2.googleapis.com/token',
+            client_id=creds_dict.get('client_id'),
+            client_secret=creds_dict.get('client_secret'),
+            scopes=creds_dict.get('scopes', [])
+        )
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        service = build('gmail', 'v1', credentials=creds)
+        result = service.users().messages().list(userId='me', maxResults=20, labelIds=['INBOX']).execute()
+        messages = result.get('messages', [])
+        emails_out = []
+        for m in messages:
+            msg = service.users().messages().get(userId='me', id=m['id'], format='metadata',
+                metadataHeaders=['From', 'Subject', 'Date']).execute()
+            headers = {h['name']: h['value'] for h in msg.get('payload', {}).get('headers', [])}
+            labels = msg.get('labelIds', [])
+            emails_out.append({
+                'id': m['id'],
+                'sender': headers.get('From', ''),
+                'subject': headers.get('Subject', '(Sans objet)'),
+                'date': headers.get('Date', ''),
+                'snippet': msg.get('snippet', ''),
+                'unread': 'UNREAD' in labels
+            })
+        return jsonify({'emails': emails_out}), 200
+    except Exception as e:
+        return jsonify({'emails': [], 'error': str(e)}), 200
 
 
 @app.route('/api/admin/gmail-scope-status', methods=['GET'])
