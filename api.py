@@ -125,6 +125,8 @@ ALLOWED_ORIGINS = [
     "https://bs-mailnotif-nine.vercel.app",
     "http://localhost:4200",
     "http://localhost:4201",
+    "http://localhost:8080",
+    "http://localhost:8081",
 ]
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
 
