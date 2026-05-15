@@ -1017,6 +1017,152 @@ def admin_delete_payment(pay_id):
         _return_db(db)
 
 
+@app.route('/api/admin/whatsapp-diagnostic', methods=['GET'])
+def admin_whatsapp_diagnostic():
+    """Diagnostic complet WhatsApp pour tous les utilisateurs configurés."""
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                SELECT id, name, email, phone, whatsapp_chat_id,
+                       gmail_refresh_token IS NOT NULL AS gmail_ok,
+                       CASE WHEN last_history_id IS NOT NULL THEN TRUE ELSE FALSE END AS monitor_ok,
+                       COALESCE(whatsapp_enabled, TRUE) AS whatsapp_enabled
+                FROM users
+                WHERE is_verified = 1
+                ORDER BY created_at DESC
+            """)
+            users = [dict(u) for u in cur.fetchall()]
+
+            # Compter les mappings récents (48h) par utilisateur
+            cur.execute("""
+                SELECT user_email, COUNT(*) as total,
+                       MAX(created_at) as last_notification
+                FROM whatsapp_email_map
+                WHERE created_at > NOW() - INTERVAL '48 hours'
+                GROUP BY user_email
+            """)
+            mapping_rows = {r['user_email']: dict(r) for r in cur.fetchall()}
+
+        report = []
+        for u in users:
+            has_phone    = bool(u.get('phone'))
+            has_chat_id  = bool(u.get('whatsapp_chat_id'))
+            gmail_ok     = bool(u.get('gmail_ok'))
+            monitor_ok   = bool(u.get('monitor_ok'))
+            wa_enabled   = bool(u.get('whatsapp_enabled'))
+            mapping_info = mapping_rows.get(u['email'], {})
+
+            # Résoudre le chat_id dynamiquement si manquant
+            resolved_chat_id = u.get('whatsapp_chat_id')
+            chat_id_source   = 'db' if has_chat_id else None
+            if not has_chat_id and has_phone:
+                phone_clean = re.sub(r'\D', '', u['phone'])
+                try:
+                    resolved = _resolve_whatsapp_chat_id(phone_clean)
+                    if resolved:
+                        resolved_chat_id = resolved
+                        chat_id_source   = 'resolved'
+                except Exception:
+                    pass
+
+            # Déterminer si la réponse WA→Gmail peut fonctionner
+            can_receive_notif  = has_phone and bool(GREEN_API_INSTANCE) and bool(GREEN_API_TOKEN) and wa_enabled
+            can_reply          = gmail_ok and bool(resolved_chat_id)
+            fully_operational  = can_receive_notif and can_reply and monitor_ok
+
+            issues = []
+            if not has_phone:         issues.append('phone manquant')
+            if not gmail_ok:          issues.append('Gmail non connecté')
+            if not monitor_ok:        issues.append('surveillance non initialisée')
+            if not resolved_chat_id:  issues.append('whatsapp_chat_id non résolu')
+            if not wa_enabled:        issues.append('WhatsApp désactivé par l\'utilisateur')
+            if not GREEN_API_INSTANCE: issues.append('GREEN_API_INSTANCE manquant (côté serveur)')
+
+            report.append({
+                'id':              u['id'],
+                'name':            u['name'],
+                'email':           u['email'],
+                'phone':           u.get('phone') or '—',
+                'whatsapp_chat_id': resolved_chat_id or '—',
+                'chat_id_source':  chat_id_source or 'absent',
+                'gmail_connected': gmail_ok,
+                'monitor_active':  monitor_ok,
+                'whatsapp_enabled': wa_enabled,
+                'can_receive_notif': can_receive_notif,
+                'can_reply_via_wa':  can_reply,
+                'fully_operational': fully_operational,
+                'recent_notifications': mapping_info.get('total', 0),
+                'last_notification':   str(mapping_info.get('last_notification', '')) or None,
+                'issues':          issues,
+            })
+
+        total      = len(report)
+        ok_count   = sum(1 for r in report if r['fully_operational'])
+        warn_count = sum(1 for r in report if r['can_receive_notif'] and not r['fully_operational'])
+        ko_count   = total - ok_count - warn_count
+
+        return jsonify({
+            'summary': {
+                'total': total,
+                'fully_operational': ok_count,
+                'partial':   warn_count,
+                'not_configured': ko_count,
+                'green_api_ready': bool(GREEN_API_INSTANCE and GREEN_API_TOKEN),
+            },
+            'users': report
+        }), 200
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        _return_db(db)
+
+
+@app.route('/api/admin/whatsapp-fix-chat-ids', methods=['POST'])
+def admin_fix_chat_ids():
+    """Résout et sauvegarde les whatsapp_chat_id manquants pour tous les users."""
+    db = get_db()
+    fixed = []
+    failed = []
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                SELECT id, email, phone FROM users
+                WHERE is_verified=1
+                  AND (whatsapp_chat_id IS NULL OR whatsapp_chat_id='')
+                  AND phone IS NOT NULL AND phone != ''
+            """)
+            users = [dict(u) for u in cur.fetchall()]
+
+        for u in users:
+            phone_clean = re.sub(r'\D', '', u['phone'])
+            try:
+                chat_id = _resolve_whatsapp_chat_id(phone_clean)
+                if chat_id:
+                    with db.cursor() as cur:
+                        cur.execute("UPDATE users SET whatsapp_chat_id=%s WHERE id=%s",
+                                    (chat_id, u['id']))
+                    db.commit()
+                    fixed.append({'email': u['email'], 'chat_id': chat_id})
+                else:
+                    # Fallback @c.us
+                    fallback = f"{phone_clean}@c.us"
+                    with db.cursor() as cur:
+                        cur.execute("UPDATE users SET whatsapp_chat_id=%s WHERE id=%s",
+                                    (fallback, u['id']))
+                    db.commit()
+                    fixed.append({'email': u['email'], 'chat_id': fallback, 'fallback': True})
+            except Exception as e:
+                failed.append({'email': u['email'], 'error': str(e)})
+
+        return jsonify({'fixed': fixed, 'failed': failed, 'total_fixed': len(fixed)}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        _return_db(db)
+
+
 @app.route('/api/admin/users/<int:user_id>/suspend', methods=['PATCH'])
 def admin_suspend_user(user_id):
     data = request.json or {}
