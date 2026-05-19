@@ -3772,22 +3772,24 @@ def chat_bot():
         return Response(stream_with_context(_sse(_keyword_fallback(message))),
                         headers=sse_headers)
 
-    # Models ordered by availability/reliability — non-streaming for reliability
+    # Models ordered by availability — (api_version, model_name)
     GEMINI_MODELS = [
-        'gemini-2.0-flash',
-        'gemini-2.0-flash-lite',
-        'gemini-1.5-flash',
+        ('v1beta', 'gemini-2.0-flash'),
+        ('v1beta', 'gemini-2.0-flash-lite'),
+        ('v1beta', 'gemini-1.5-flash-8b'),
+        ('v1',     'gemini-1.5-flash'),
+        ('v1',     'gemini-1.5-pro'),
     ]
 
-    def _call_gemini(model):
+    def _call_gemini(api_ver, model):
         """Non-streaming call — simpler, no proxy buffering issues."""
         url = (
-            f'https://generativelanguage.googleapis.com/v1beta/models/'
+            f'https://generativelanguage.googleapis.com/{api_ver}/models/'
             f'{model}:generateContent?key={GEMINI_API_KEY}'
         )
         resp = requests.post(url, json=body, timeout=12)
         if not resp.ok:
-            print(f"[Chat] {model} HTTP {resp.status_code}: {resp.text[:200]}")
+            print(f"[Chat] {model} HTTP {resp.status_code}: {resp.text[:300]}")
             return None
         d = resp.json()
         return d['candidates'][0]['content']['parts'][0]['text']
@@ -3795,9 +3797,9 @@ def chat_bot():
     def generate():
         # First byte immediately — unblocks Render proxy buffering
         yield ': ok\n\n'
-        for model in GEMINI_MODELS:
+        for api_ver, model in GEMINI_MODELS:
             try:
-                text = _call_gemini(model)
+                text = _call_gemini(api_ver, model)
                 if text:
                     print(f"[Chat] {model} OK ({len(text)} chars)")
                     yield f'data: {_json.dumps({"text": text})}\n\n'
