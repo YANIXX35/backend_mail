@@ -3744,7 +3744,7 @@ def chat_bot():
             contents.append({'role': 'model', 'parts': [{'text': content}]})
     contents.append({'role': 'user', 'parts': [{'text': message}]})
 
-    chat_models = ['gemini-2.0-flash', 'gemini-2.5-flash-lite']
+    chat_models = ['gemini-2.0-flash', 'gemini-2.5-flash-lite', 'gemini-1.5-flash']
     last_chat_err = None
     for chat_model in chat_models:
         url = (
@@ -3772,7 +3772,28 @@ def chat_bot():
 
     if _sentry_dsn and last_chat_err and '429' not in str(last_chat_err) and 'timeout' not in str(last_chat_err).lower():
         sentry_sdk.capture_exception(last_chat_err)
-    return jsonify({'response': "Desole, erreur momentanee. Reessaie dans un instant !"}), 200
+
+    # Fallback intelligent par mots-clés quand Gemini est indisponible
+    msg_lower = message.lower()
+    if any(w in msg_lower for w in ['tarif', 'prix', 'cout', 'coût', 'combien', 'payer', 'abonnement']):
+        fallback = "💰 Tarifs MailNotifier :\n• Gratuit : Gmail + Telegram, pour toujours\n• Premium (5 000 XOF/mois) : + WhatsApp + filtres avancés\n• Enterprise (15 000 XOF/mois) : + Support prioritaire"
+    elif any(w in msg_lower for w in ['whatsapp', 'wha', 'wa']):
+        fallback = "📱 Pour activer WhatsApp : va dans Paramètres → WhatsApp, entre ton numéro, vérifie-le, puis copie l'URL webhook dans ton dashboard Green API. Le plan Premium est requis."
+    elif any(w in msg_lower for w in ['telegram', 'tele']):
+        fallback = "✈️ Pour Telegram : cherche @Kylimail_bot sur Telegram, envoie /start, récupère ton Chat ID et colle-le dans Paramètres → Telegram. C'est gratuit !"
+    elif any(w in msg_lower for w in ['gmail', 'google', 'connecter', 'oauth']):
+        fallback = "📧 Pour connecter Gmail : va dans Paramètres → Gmail, clique 'Connecter Gmail', autorise l'accès Google. MailNotifier détectera tes nouveaux mails en moins de 30 secondes."
+    elif any(w in msg_lower for w in ['commencer', 'inscription', 'créer', 'creer', 'compte', 'register', 'sign']):
+        fallback = "🚀 3 étapes pour démarrer :\n1️⃣ Crée ton compte avec email + code OTP\n2️⃣ Connecte Gmail via OAuth\n3️⃣ Configure Telegram (gratuit) ou WhatsApp (premium)\nC'est tout !"
+    elif any(w in msg_lower for w in ['aide', 'help', 'comment', 'fonctionn', 'marche', 'utiliser']):
+        fallback = "🤖 MailNotifier surveille ta boite Gmail et t'envoie chaque nouveau mail sur Telegram et/ou WhatsApp en temps réel. Tu peux répondre directement depuis WhatsApp ! Qu'est-ce que tu veux savoir ?"
+    elif any(w in msg_lower for w in ['notification', 'alerte', 'notif']):
+        fallback = "🔔 Les notifications arrivent en moins de 30s après réception du mail. Tu reçois : l'expéditeur, l'objet, un aperçu du contenu, et tu peux répondre directement depuis WhatsApp ou Telegram."
+    elif any(w in msg_lower for w in ['repondre', 'répondre', 'reply', 'réponse', 'reponse']):
+        fallback = "✍️ Pour répondre à un mail depuis WhatsApp : glisse la notification reçue (swipe to reply) et écris ta réponse. Elle sera envoyée automatiquement par Gmail à l'expéditeur !"
+    else:
+        fallback = "😊 Je suis l'assistant MailNotifier ! Je peux t'aider avec : les tarifs, la configuration Gmail/Telegram/WhatsApp, comment répondre aux mails, ou toute autre question sur l'app."
+    return jsonify({'response': fallback}), 200
 
 
 def _send_weekly_summary_to_user(user: dict):
