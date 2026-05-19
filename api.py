@@ -3772,42 +3772,30 @@ def chat_bot():
         return Response(stream_with_context(_sse(_keyword_fallback(message))),
                         headers=sse_headers)
 
-    # Models ordered by availability — (api_version, model_name)
-    GEMINI_MODELS = [
-        ('v1beta', 'gemini-2.0-flash'),
-        ('v1beta', 'gemini-2.0-flash-lite'),
-        ('v1beta', 'gemini-1.5-flash-8b'),
-        ('v1',     'gemini-1.5-flash'),
-        ('v1',     'gemini-1.5-pro'),
-    ]
-
-    def _call_gemini(api_ver, model):
-        """Non-streaming call — simpler, no proxy buffering issues."""
+    def _call_gemini():
         url = (
-            f'https://generativelanguage.googleapis.com/{api_ver}/models/'
-            f'{model}:generateContent?key={GEMINI_API_KEY}'
+            'https://generativelanguage.googleapis.com/v1beta/models/'
+            f'gemini-2.5-flash-lite:generateContent?key={GEMINI_API_KEY}'
         )
-        resp = requests.post(url, json=body, timeout=12)
+        resp = requests.post(url, json=body, timeout=20)
+        print(f"[Chat] gemini-2.5-flash-lite HTTP {resp.status_code}")
         if not resp.ok:
-            print(f"[Chat] {model} HTTP {resp.status_code}: {resp.text[:300]}")
+            print(f"[Chat] Error: {resp.text[:400]}")
             return None
         d = resp.json()
         return d['candidates'][0]['content']['parts'][0]['text']
 
     def generate():
-        # First byte immediately — unblocks Render proxy buffering
         yield ': ok\n\n'
-        for api_ver, model in GEMINI_MODELS:
-            try:
-                text = _call_gemini(api_ver, model)
-                if text:
-                    print(f"[Chat] {model} OK ({len(text)} chars)")
-                    yield f'data: {_json.dumps({"text": text})}\n\n'
-                    yield 'data: [DONE]\n\n'
-                    return
-            except Exception as e:
-                print(f"[Chat] {model} error: {e}")
-        print("[Chat] All models failed — keyword fallback")
+        try:
+            text = _call_gemini()
+            if text:
+                yield f'data: {_json.dumps({"text": text})}\n\n'
+                yield 'data: [DONE]\n\n'
+                return
+        except Exception as e:
+            print(f"[Chat] gemini-2.5-flash-lite error: {e}")
+        print("[Chat] Gemini failed — keyword fallback")
         yield from _sse(_keyword_fallback(message))
 
     return Response(stream_with_context(generate()), headers=sse_headers)
