@@ -207,6 +207,10 @@ GMAIL_SCOPES         = [
 _init_firebase()
 notifier_status = {"running": False}
 
+# Cache mémoire pour le chatbot (évite de rappeler Gemini pour la même question)
+_chat_cache: dict = {}
+_CHAT_CACHE_TTL = timedelta(hours=1)
+
 # Middleware JWT pour sécuriser les endpoints
 def token_required(f):
     @wraps(f)
@@ -3698,9 +3702,9 @@ def api_version():
 
 
 @app.route('/api/chatbot', methods=['POST'])
-@limiter.limit("30 per hour; 5 per minute")
+@limiter.limit("60 per hour; 10 per minute")
 def chat_bot():
-    """Chatbot IA MailNotifier — Gemini 2.5 Flash Lite streaming SSE."""
+    """Chatbot IA MailNotifier — gemini-1.5-flash (1500 req/jour) + cache + fallback."""
     data    = request.get_json() or {}
     message = _str(data.get('message', ''), 500).strip()
     history = data.get('history', [])
@@ -3772,30 +3776,56 @@ def chat_bot():
         return Response(stream_with_context(_sse(_keyword_fallback(message))),
                         headers=sse_headers)
 
-    def _call_gemini():
-        url = (
-            'https://generativelanguage.googleapis.com/v1beta/models/'
-            f'gemini-2.5-flash-lite:generateContent?key={GEMINI_API_KEY}'
-        )
-        resp = requests.post(url, json=body, timeout=20)
-        print(f"[Chat] gemini-2.5-flash-lite HTTP {resp.status_code}")
-        if not resp.ok:
-            print(f"[Chat] Error: {resp.text[:400]}")
-            return None
-        d = resp.json()
-        return d['candidates'][0]['content']['parts'][0]['text']
+    # Modèles par ordre de priorité : 1.5-flash (1500 req/jour) → 1.5-flash-8b (1500 req/jour)
+    GEMINI_MODELS = [
+        ('v1beta', 'gemini-1.5-flash'),
+        ('v1',     'gemini-1.5-flash'),
+        ('v1beta', 'gemini-1.5-flash-8b'),
+    ]
+
+    def _call_gemini_cached():
+        # Cache : évite de consommer du quota pour la même question
+        cache_key = hashlib.md5(message.lower().strip().encode()).hexdigest()
+        if cache_key in _chat_cache:
+            cached_at, cached_text = _chat_cache[cache_key]
+            if datetime.now() - cached_at < _CHAT_CACHE_TTL:
+                print(f"[Chat] Cache hit pour: {message[:40]}")
+                return cached_text
+
+        for api_ver, model in GEMINI_MODELS:
+            url = (
+                f'https://generativelanguage.googleapis.com/{api_ver}/models/'
+                f'{model}:generateContent?key={GEMINI_API_KEY}'
+            )
+            try:
+                resp = requests.post(url, json=body, timeout=20)
+                print(f"[Chat] {model} ({api_ver}) HTTP {resp.status_code}")
+                if resp.status_code == 429:
+                    print(f"[Chat] {model} quota épuisé, modèle suivant…")
+                    continue
+                if not resp.ok:
+                    print(f"[Chat] {model} erreur: {resp.text[:200]}")
+                    continue
+                d    = resp.json()
+                text = d['candidates'][0]['content']['parts'][0]['text']
+                if text:
+                    _chat_cache[cache_key] = (datetime.now(), text)
+                    return text
+            except Exception as e:
+                print(f"[Chat] {model} exception: {e}")
+        return None
 
     def generate():
         yield ': ok\n\n'
         try:
-            text = _call_gemini()
+            text = _call_gemini_cached()
             if text:
                 yield f'data: {_json.dumps({"text": text})}\n\n'
                 yield 'data: [DONE]\n\n'
                 return
         except Exception as e:
-            print(f"[Chat] gemini-2.5-flash-lite error: {e}")
-        print("[Chat] Gemini failed — keyword fallback")
+            print(f"[Chat] Erreur inattendue: {e}")
+        print("[Chat] Tous les modèles ont échoué — keyword fallback")
         yield from _sse(_keyword_fallback(message))
 
     return Response(stream_with_context(generate()), headers=sse_headers)
