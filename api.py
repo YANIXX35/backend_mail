@@ -3776,15 +3776,14 @@ def chat_bot():
         return Response(stream_with_context(_sse(_keyword_fallback(message))),
                         headers=sse_headers)
 
-    # Modèles par ordre de priorité : 1.5-flash (1500 req/jour) → 1.5-flash-8b (1500 req/jour)
+    # RÈGLE : toujours v1beta (system_instruction n'existe pas en v1)
+    # gemini-2.0-flash → gemini-2.0-flash-lite en fallback (1500 req/jour chacun)
     GEMINI_MODELS = [
-        ('v1beta', 'gemini-1.5-flash'),
-        ('v1',     'gemini-1.5-flash'),
-        ('v1beta', 'gemini-1.5-flash-8b'),
+        'gemini-2.0-flash',
+        'gemini-2.0-flash-lite',
     ]
 
     def _call_gemini_cached():
-        # Cache : évite de consommer du quota pour la même question
         cache_key = hashlib.md5(message.lower().strip().encode()).hexdigest()
         if cache_key in _chat_cache:
             cached_at, cached_text = _chat_cache[cache_key]
@@ -3792,16 +3791,16 @@ def chat_bot():
                 print(f"[Chat] Cache hit pour: {message[:40]}")
                 return cached_text
 
-        for api_ver, model in GEMINI_MODELS:
+        for model in GEMINI_MODELS:
             url = (
-                f'https://generativelanguage.googleapis.com/{api_ver}/models/'
+                f'https://generativelanguage.googleapis.com/v1beta/models/'
                 f'{model}:generateContent?key={GEMINI_API_KEY}'
             )
             try:
                 resp = requests.post(url, json=body, timeout=20)
-                print(f"[Chat] {model} ({api_ver}) HTTP {resp.status_code}")
+                print(f"[Chat] {model} HTTP {resp.status_code}")
                 if resp.status_code == 429:
-                    print(f"[Chat] {model} quota épuisé, modèle suivant…")
+                    print(f"[Chat] {model} quota épuisé, essai suivant…")
                     continue
                 if not resp.ok:
                     print(f"[Chat] {model} erreur: {resp.text[:200]}")
