@@ -2119,74 +2119,22 @@ def ai_analyze():
             for i, e in enumerate(emails_data)
         )
 
-        prompt = f"""Tu es un assistant IA de gestion d'emails. Analyse ces {len(emails_data)} emails récents et réponds UNIQUEMENT en JSON valide, sans texte avant ni après.
-
-EMAILS:
-{emails_text}
-
-Réponds avec ce JSON exact:
-{{
-  "summary": "Résumé de 2 phrases max de l'état de la boîte mail",
-  "urgent_count": <nombre d'emails urgents/importants>,
-  "important_count": <nombre d'emails importants>,
-  "newsletter_count": <nombre de newsletters/promotions>,
-  "normal_count": <nombre d'emails normaux>,
-  "actions": ["action1 concrète à faire", "action2"],
-  "emails": [
-    {{"id": "<id>", "category": "important|newsletter|normal", "reason": "raison courte en français", "priority": "high|medium|low"}}
-  ]
-}}
-
-Règles de classification:
-- important: factures, paiements, sécurité, urgences, réunions, contrats, mots de passe, alertes compte
-- newsletter: promotions, publicités, désabonnement, marketing, offres commerciales
-- normal: tout le reste (emails de collègues, notifications informatives, etc.)"""
-
-        GEMINI_MODELS = [
-            'gemini-2.0-flash',
-            'gemini-2.5-flash-lite',
-        ]
-
-        import json as _json_ai
-
-        resp = None
-        last_err = None
-        for model_name in GEMINI_MODELS:
-            url = (
-                'https://generativelanguage.googleapis.com/v1beta/models/'
-                f'{model_name}:generateContent?key={GEMINI_API_KEY}'
-            )
-            try:
-                resp = requests.post(
-                    url,
-                    headers={'Content-Type': 'application/json'},
-                    json={
-                        'contents': [{'role': 'user', 'parts': [{'text': prompt}]}],
-                        'generationConfig': {'maxOutputTokens': 1500, 'temperature': 0.2},
-                    },
-                    timeout=(5, 45),
-                )
-                resp.raise_for_status()
-                break
-            except Exception as e:
-                last_err = e
-                resp = None
-                continue
-
-        if resp is None:
-            raise last_err
-
-        raw = resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-        # Strip markdown code fences if present
-        if '```' in raw:
-            parts = raw.split('```')
-            # parts[1] is the content between first and second fence
-            raw = parts[1] if len(parts) > 1 else raw
-            if raw.startswith('json'):
-                raw = raw[4:]
-            raw = raw.strip()
-        analysis = _json_ai.loads(raw)
-        _cache_set(cache_key, analysis, ttl=300)   # 5 min
+        # Gemini désactivé — quota réservé au chatbot uniquement
+        # Analyse statique basée sur les emails lus (sans appel API)
+        unread_count = sum(1 for e in emails_data if e['unread'])
+        analysis = {
+            "summary": f"Vous avez {len(emails_data)} emails récents dont {unread_count} non lus.",
+            "urgent_count": 0,
+            "important_count": unread_count,
+            "newsletter_count": 0,
+            "normal_count": len(emails_data) - unread_count,
+            "actions": ["Consultez vos emails non lus en priorité."] if unread_count else [],
+            "emails": [
+                {"id": e['id'], "category": "normal", "reason": "Analyse IA désactivée", "priority": "low"}
+                for e in emails_data
+            ],
+        }
+        _cache_set(cache_key, analysis, ttl=300)
         return jsonify(analysis)
 
     except Exception as e:
@@ -2719,36 +2667,7 @@ def _handle_wa_command(cmd: str, user_email: str, chat_id: str) -> bool:
 
 
 def _get_smart_reply_suggestions(user_email: str, ctx: dict) -> str:
-    """Utilise Gemini pour générer 3 suggestions de réponse basées sur le dernier email."""
-    GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-    if not GEMINI_API_KEY:
-        return ''
-    sender = ctx.get('last_sender', '')
-    subject = ctx.get('last_subject', '')
-    snippet = ctx.get('last_snippet', '')
-    match = re.match(r'^(.+?)\s*<', sender)
-    sender_name = match.group(1).strip().strip('"') if match else sender.split('@')[0]
-    prompt = (
-        f"Tu es un assistant email professionnel. "
-        f"Voici un email reçu :\n"
-        f"De : {sender_name}\n"
-        f"Objet : {subject}\n"
-        f"Contenu : {snippet[:500]}\n\n"
-        f"Génère exactement 3 suggestions de réponse courtes (2-3 phrases max chacune), "
-        f"professionnelles et en français. "
-        f"Format : numérote chaque suggestion (1., 2., 3.) sans entête ni explication."
-    )
-    models = ['gemini-2.0-flash', 'gemini-2.5-flash-lite']
-    for model in models:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-            body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 400}}
-            resp = requests.post(url, json=body, timeout=20)
-            if resp.ok:
-                text = resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-                return f"🤖 *Suggestions de réponse IA :*\n\n{text}\n\n_Répondez à la notification avec votre réponse._"
-        except Exception as e:
-            print(f"[SmartReply] {model} error: {e}")
+    """Gemini désactivé — quota réservé au chatbot uniquement."""
     return ''
 
 
