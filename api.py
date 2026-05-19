@@ -3632,6 +3632,7 @@ def chat_bot():
         return jsonify({'error': 'message requis'}), 400
 
     GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+    print(f"[Chat] Clé utilisée: ...{GEMINI_API_KEY[-8:] if GEMINI_API_KEY else 'AUCUNE'}")
 
     system_prompt = (
         "Tu es un assistant IA intelligent, sympathique et polyvalent intégré dans MailNotifier.\n\n"
