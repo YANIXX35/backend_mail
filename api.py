@@ -3772,54 +3772,40 @@ def chat_bot():
         return Response(stream_with_context(_sse(_keyword_fallback(message))),
                         headers=sse_headers)
 
+    # Models ordered by availability/reliability — non-streaming for reliability
     GEMINI_MODELS = [
-        'gemini-2.5-flash-lite',
         'gemini-2.0-flash',
         'gemini-2.0-flash-lite',
         'gemini-1.5-flash',
     ]
 
+    def _call_gemini(model):
+        """Non-streaming call — simpler, no proxy buffering issues."""
+        url = (
+            f'https://generativelanguage.googleapis.com/v1beta/models/'
+            f'{model}:generateContent?key={GEMINI_API_KEY}'
+        )
+        resp = requests.post(url, json=body, timeout=12)
+        if not resp.ok:
+            print(f"[Chat] {model} HTTP {resp.status_code}: {resp.text[:200]}")
+            return None
+        d = resp.json()
+        return d['candidates'][0]['content']['parts'][0]['text']
+
     def generate():
+        # First byte immediately — unblocks Render proxy buffering
+        yield ': ok\n\n'
         for model in GEMINI_MODELS:
-            url = (
-                f'https://generativelanguage.googleapis.com/v1beta/models/'
-                f'{model}:streamGenerateContent?alt=sse&key={GEMINI_API_KEY}'
-            )
             try:
-                with requests.post(url, json=body, stream=True, timeout=60) as resp:
-                    if not resp.ok:
-                        print(f"[Chat] {model} HTTP {resp.status_code}: {resp.text[:300]}")
-                        continue
-                    buf     = ''
-                    yielded = False
-                    for chunk in resp.iter_content(chunk_size=None, decode_unicode=True):
-                        if not chunk:
-                            continue
-                        buf += chunk
-                        lines = buf.split('\n')
-                        buf   = lines[-1]
-                        for line in lines[:-1]:
-                            line = line.strip()
-                            if not line.startswith('data: '):
-                                continue
-                            raw = line[6:]
-                            if raw == '[DONE]':
-                                break
-                            try:
-                                d    = _json.loads(raw)
-                                text = d['candidates'][0]['content']['parts'][0]['text']
-                                if text:
-                                    yield f'data: {_json.dumps({"text": text})}\n\n'
-                                    yielded = True
-                            except (KeyError, IndexError, ValueError):
-                                pass
-                    if yielded:
-                        yield 'data: [DONE]\n\n'
-                        return
-                    print(f"[Chat] {model} yielded nothing, trying next…")
+                text = _call_gemini(model)
+                if text:
+                    print(f"[Chat] {model} OK ({len(text)} chars)")
+                    yield f'data: {_json.dumps({"text": text})}\n\n'
+                    yield 'data: [DONE]\n\n'
+                    return
             except Exception as e:
                 print(f"[Chat] {model} error: {e}")
-        print("[Chat] All Gemini models failed — keyword fallback")
+        print("[Chat] All models failed — keyword fallback")
         yield from _sse(_keyword_fallback(message))
 
     return Response(stream_with_context(generate()), headers=sse_headers)
