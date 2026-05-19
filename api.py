@@ -17,7 +17,7 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request as GoogleRequest
 from googleapiclient.errors import HttpError
-from flask import Flask, jsonify, request, redirect, render_template  # noqa: F401
+from flask import Flask, jsonify, request, redirect, render_template, Response, stream_with_context  # noqa: F401
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -3700,7 +3700,7 @@ def api_version():
 @app.route('/api/chatbot', methods=['POST'])
 @limiter.limit("30 per hour; 5 per minute")
 def chat_bot():
-    """Chatbot IA MailNotifier — Gemini 2.5 Flash Lite via REST."""
+    """Chatbot IA MailNotifier — Gemini 2.5 Flash Lite streaming SSE."""
     data    = request.get_json() or {}
     message = _str(data.get('message', ''), 500).strip()
     history = data.get('history', [])
@@ -3709,29 +3709,22 @@ def chat_bot():
         return jsonify({'error': 'message requis'}), 400
 
     GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-    if not GEMINI_API_KEY:
-        return jsonify({'response': (
-            "Bonjour ! Je suis l'assistant MailNotifier. \U0001f60a "
-            "MailNotifier surveille ta boite Gmail et t'envoie des alertes Telegram et WhatsApp. "
-            "Cree ton compte gratuitement en haut de la page !"
-        )}), 200
 
     system_prompt = (
         "Tu es un assistant IA intelligent, sympathique et polyvalent intégré dans MailNotifier.\n\n"
-        "Tu peux répondre à TOUTES les questions sans exception : culture générale, science, histoire, technologie, "
-        "cuisine, sport, voyages, langues, maths, code, actualités, conseils de vie, blagues, créativité, etc. "
-        "Tu n'as aucune restriction de sujet — réponds toujours avec enthousiasme.\n\n"
-        "Si la question concerne MailNotifier, tu connais ces infos :\n"
+        "Tu peux répondre à TOUTES les questions sans exception : culture générale, science, histoire, "
+        "technologie, cuisine, sport, voyages, langues, maths, code, actualités, conseils de vie, "
+        "blagues, créativité, etc. Tu n'as aucune restriction de sujet.\n\n"
+        "Si la question concerne MailNotifier :\n"
         "- Surveillance Gmail OAuth2, nouveau mail détecté en < 30 secondes\n"
         "- Notifications Telegram (gratuit) et WhatsApp (premium)\n"
-        "- Réponse aux mails depuis WhatsApp en glissant la notification\n"
+        "- Réponse aux mails depuis WhatsApp : glisser la notification et écrire\n"
         "- Commandes WhatsApp : !aide, !templates, !statut, !dernier, !smart\n"
         "- Gratuit : Gmail + Telegram | Premium 5 000 XOF/mois : + WhatsApp | Enterprise 15 000 XOF/mois\n\n"
-        "STYLE : Réponds en français, naturel et chaleureux, 2-5 phrases selon la complexité. "
-        "1-2 emojis max. Sois direct et utile. Ne refuse JAMAIS une question."
+        "STYLE : Réponds en français, naturel et chaleureux. "
+        "1-2 emojis max. Sois direct. Ne refuse JAMAIS une question."
     )
 
-    # Format Gemini: role "bot" → "model", system_instruction separe
     contents = []
     for h in (history or [])[-6:]:
         role    = h.get('role', '')
@@ -3742,56 +3735,81 @@ def chat_bot():
             contents.append({'role': 'model', 'parts': [{'text': content}]})
     contents.append({'role': 'user', 'parts': [{'text': message}]})
 
-    chat_models = ['gemini-2.5-flash-lite', 'gemini-2.0-flash', 'gemini-1.5-flash']
-    last_chat_err = None
-    for chat_model in chat_models:
+    body = {
+        'system_instruction': {'parts': [{'text': system_prompt}]},
+        'contents': contents,
+        'generationConfig': {'maxOutputTokens': 1024, 'temperature': 0.7},
+    }
+
+    sse_headers = {
+        'Content-Type':      'text/event-stream',
+        'Cache-Control':     'no-cache',
+        'X-Accel-Buffering': 'no',
+        'Connection':        'keep-alive',
+    }
+
+    def _sse(text):
+        yield f'data: {_json.dumps({"text": text})}\n\n'
+        yield 'data: [DONE]\n\n'
+
+    def _keyword_fallback(msg):
+        m = msg.lower()
+        if any(w in m for w in ['tarif', 'prix', 'cout', 'combien', 'payer', 'abonnement']):
+            return "💰 Tarifs MailNotifier :\n• Gratuit : Gmail + Telegram\n• Premium (5 000 XOF/mois) : + WhatsApp\n• Enterprise (15 000 XOF/mois) : + Support prioritaire"
+        if any(w in m for w in ['whatsapp', 'wha']):
+            return "📱 Pour WhatsApp : Paramètres → WhatsApp, entre ton numéro, vérifie-le, copie l'URL webhook dans Green API. Plan Premium requis."
+        if any(w in m for w in ['telegram', 'tele']):
+            return "✈️ Pour Telegram : cherche @Kylimail_bot, envoie /start, copie ton Chat ID dans Paramètres → Telegram. C'est gratuit !"
+        if any(w in m for w in ['gmail', 'google', 'oauth']):
+            return "📧 Pour Gmail : Paramètres → Gmail → Connecter Gmail, autorise l'accès Google. Détection en < 30 secondes."
+        if any(w in m for w in ['commencer', 'inscription', 'créer', 'creer', 'compte']):
+            return "🚀 3 étapes : 1️⃣ Inscription email+OTP  2️⃣ Connexion Gmail  3️⃣ Config Telegram ou WhatsApp. C'est tout !"
+        if any(w in m for w in ['repondre', 'répondre', 'reply']):
+            return "✍️ Glisse la notification WhatsApp reçue (swipe to reply) et écris ta réponse. Elle part par Gmail à l'expéditeur !"
+        return "😊 Je suis l'assistant MailNotifier ! Pose-moi n'importe quelle question — je réponds à tout."
+
+    if not GEMINI_API_KEY:
+        return Response(stream_with_context(_sse(_keyword_fallback(message))),
+                        headers=sse_headers)
+
+    def generate():
         url = (
             'https://generativelanguage.googleapis.com/v1beta/models/'
-            f'{chat_model}:generateContent?key={GEMINI_API_KEY}'
+            f'gemini-2.5-flash-lite:streamGenerateContent?alt=sse&key={GEMINI_API_KEY}'
         )
         try:
-            resp = requests.post(
-                url,
-                headers={'Content-Type': 'application/json'},
-                json={
-                    'system_instruction': {'parts': [{'text': system_prompt}]},
-                    'contents': contents,
-                    'generationConfig': {'maxOutputTokens': 250, 'temperature': 0.7},
-                },
-                timeout=(5, 20),
-            )
-            resp.raise_for_status()
-            text = resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-            return jsonify({'response': text})
+            with requests.post(url, json=body, stream=True, timeout=60) as resp:
+                if not resp.ok:
+                    print(f"[Chat] Gemini HTTP {resp.status_code}: {resp.text[:200]}")
+                    yield from _sse(_keyword_fallback(message))
+                    return
+                buf = ''
+                for chunk in resp.iter_content(chunk_size=None, decode_unicode=True):
+                    if not chunk:
+                        continue
+                    buf += chunk
+                    lines = buf.split('\n')
+                    buf   = lines[-1]
+                    for line in lines[:-1]:
+                        line = line.strip()
+                        if not line.startswith('data: '):
+                            continue
+                        raw = line[6:]
+                        if raw == '[DONE]':
+                            break
+                        try:
+                            d    = _json.loads(raw)
+                            text = d['candidates'][0]['content']['parts'][0]['text']
+                            if text:
+                                yield f'data: {_json.dumps({"text": text})}\n\n'
+                        except (KeyError, IndexError, ValueError):
+                            pass
+                yield 'data: [DONE]\n\n'
         except Exception as e:
-            print(f"[Chat] Erreur Gemini ({chat_model}): {e}")
-            last_chat_err = e
-            continue
+            print(f"[Chat] Stream error: {e}")
+            yield from _sse(_keyword_fallback(message))
 
-    if _sentry_dsn and last_chat_err and '429' not in str(last_chat_err) and 'timeout' not in str(last_chat_err).lower():
-        sentry_sdk.capture_exception(last_chat_err)
-
-    # Fallback intelligent par mots-clés quand Gemini est indisponible
-    msg_lower = message.lower()
-    if any(w in msg_lower for w in ['tarif', 'prix', 'cout', 'coût', 'combien', 'payer', 'abonnement']):
-        fallback = "💰 Tarifs MailNotifier :\n• Gratuit : Gmail + Telegram, pour toujours\n• Premium (5 000 XOF/mois) : + WhatsApp + filtres avancés\n• Enterprise (15 000 XOF/mois) : + Support prioritaire"
-    elif any(w in msg_lower for w in ['whatsapp', 'wha', 'wa']):
-        fallback = "📱 Pour activer WhatsApp : va dans Paramètres → WhatsApp, entre ton numéro, vérifie-le, puis copie l'URL webhook dans ton dashboard Green API. Le plan Premium est requis."
-    elif any(w in msg_lower for w in ['telegram', 'tele']):
-        fallback = "✈️ Pour Telegram : cherche @Kylimail_bot sur Telegram, envoie /start, récupère ton Chat ID et colle-le dans Paramètres → Telegram. C'est gratuit !"
-    elif any(w in msg_lower for w in ['gmail', 'google', 'connecter', 'oauth']):
-        fallback = "📧 Pour connecter Gmail : va dans Paramètres → Gmail, clique 'Connecter Gmail', autorise l'accès Google. MailNotifier détectera tes nouveaux mails en moins de 30 secondes."
-    elif any(w in msg_lower for w in ['commencer', 'inscription', 'créer', 'creer', 'compte', 'register', 'sign']):
-        fallback = "🚀 3 étapes pour démarrer :\n1️⃣ Crée ton compte avec email + code OTP\n2️⃣ Connecte Gmail via OAuth\n3️⃣ Configure Telegram (gratuit) ou WhatsApp (premium)\nC'est tout !"
-    elif any(w in msg_lower for w in ['aide', 'help', 'comment', 'fonctionn', 'marche', 'utiliser']):
-        fallback = "🤖 MailNotifier surveille ta boite Gmail et t'envoie chaque nouveau mail sur Telegram et/ou WhatsApp en temps réel. Tu peux répondre directement depuis WhatsApp ! Qu'est-ce que tu veux savoir ?"
-    elif any(w in msg_lower for w in ['notification', 'alerte', 'notif']):
-        fallback = "🔔 Les notifications arrivent en moins de 30s après réception du mail. Tu reçois : l'expéditeur, l'objet, un aperçu du contenu, et tu peux répondre directement depuis WhatsApp ou Telegram."
-    elif any(w in msg_lower for w in ['repondre', 'répondre', 'reply', 'réponse', 'reponse']):
-        fallback = "✍️ Pour répondre à un mail depuis WhatsApp : glisse la notification reçue (swipe to reply) et écris ta réponse. Elle sera envoyée automatiquement par Gmail à l'expéditeur !"
-    else:
-        fallback = "😊 Je suis l'assistant MailNotifier ! Je peux t'aider avec : les tarifs, la configuration Gmail/Telegram/WhatsApp, comment répondre aux mails, ou toute autre question sur l'app."
-    return jsonify({'response': fallback}), 200
+    return Response(stream_with_context(generate()), headers=sse_headers)
 
 
 def _send_weekly_summary_to_user(user: dict):
