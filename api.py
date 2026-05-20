@@ -2881,22 +2881,42 @@ def _send_teams_notification(webhook_url, sender, subject, snippet, category='no
         return
     match = re.match(r'^(.+?)\s*<', sender)
     sender_name = match.group(1).strip().strip('"') if match else sender.split('@')[0]
-    cat_labels = {
-        'important':  '🔴 Important',
-        'newsletter': '🟡 Newsletter',
-        'normal':     '🔵 Normal',
-    }
+    cat_colors = {'important': 'attention', 'newsletter': 'warning', 'normal': 'accent'}
+    cat_labels = {'important': '🔴 Important', 'newsletter': '🟡 Newsletter', 'normal': '🔵 Normal'}
     cat_label = cat_labels.get(category, '🔵 Normal')
+    cat_color = cat_colors.get(category, 'accent')
+    # Adaptive Card format — compatible Power Automate Workflows webhook
     card = {
-        "@type": "MessageCard",
-        "@context": "http://schema.org/extensions",
-        "themeColor": "0078D4",
-        "summary": f"Nouveau mail : {subject}",
-        "sections": [{
-            "activityTitle": f"📬 MailNotifier — {cat_label}",
-            "activitySubtitle": f"De : {sender_name}",
-            "activityText": f"**{subject}**\n\n{snippet[:200]}",
-            "markdown": True
+        "type": "message",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard",
+                "version": "1.2",
+                "body": [
+                    {
+                        "type": "TextBlock",
+                        "text": f"📬 MailNotifier — {cat_label}",
+                        "weight": "Bolder",
+                        "size": "Medium",
+                        "color": cat_color
+                    },
+                    {
+                        "type": "FactSet",
+                        "facts": [
+                            {"title": "De", "value": sender_name},
+                            {"title": "Objet", "value": subject}
+                        ]
+                    },
+                    {
+                        "type": "TextBlock",
+                        "text": snippet[:300],
+                        "wrap": True,
+                        "isSubtle": True
+                    }
+                ]
+            }
         }]
     }
     try:
