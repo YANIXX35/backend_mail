@@ -401,6 +401,8 @@ def init_db():
             # v2 scope flag — nouvelle colonne propre qui part à FALSE pour tous (y compris les
             # utilisateurs existants dont gmail_send_scope était déjà TRUE par erreur).
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_scope_v2 BOOLEAN DEFAULT FALSE")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS teams_webhook_url VARCHAR(500)")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS teams_enabled BOOLEAN DEFAULT TRUE")
             # Pré-remplir le chatId @lid connu pour kyliyanisse (checkWhatsapp retourne 404 sur ce serveur)
             cur.execute("""
                 UPDATE users SET whatsapp_chat_id='62508954075303@lid'
@@ -2292,7 +2294,9 @@ def get_user_settings():
                 "green_api_token, app_password, avatar, theme_color, font_family, theme_mode, theme_secondary, "
                 "to_char(theme_updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS theme_updated_at, "
                 "COALESCE(telegram_enabled, TRUE) AS telegram_enabled, "
-                "COALESCE(whatsapp_enabled, TRUE) AS whatsapp_enabled "
+                "COALESCE(whatsapp_enabled, TRUE) AS whatsapp_enabled, "
+                "COALESCE(teams_webhook_url, '') AS teams_webhook_url, "
+                "COALESCE(teams_enabled, TRUE) AS teams_enabled "
                 "FROM users WHERE email = %s AND is_verified = 1",
                 (email,)
             )
@@ -2305,7 +2309,8 @@ def get_user_settings():
                 "app_password_set": False, "avatar": "",
                 "theme_color": "", "font_family": "", "theme_mode": "light",
                 "theme_secondary": "", "theme_updated_at": None,
-                "telegram_enabled": True, "whatsapp_enabled": True
+                "telegram_enabled": True, "whatsapp_enabled": True,
+                "teams_webhook_url": "", "teams_enabled": True
             })
         user = dict(user)
         for key in ["phone", "gmail_address", "telegram_chat_id", "green_api_instance",
@@ -2315,6 +2320,8 @@ def get_user_settings():
                 user[key] = ""
         user['telegram_enabled'] = bool(user.get('telegram_enabled', True))
         user['whatsapp_enabled'] = bool(user.get('whatsapp_enabled', True))
+        user['teams_webhook_url'] = user.get('teams_webhook_url') or ''
+        user['teams_enabled'] = bool(user.get('teams_enabled', True))
         user['app_password_set'] = bool(user.pop('app_password', None))
         if not user.get('theme_mode'):
             user['theme_mode'] = 'light'
@@ -2382,7 +2389,9 @@ def update_user_settings():
                         theme_secondary  = COALESCE(%s, theme_secondary),
                         theme_updated_at = CASE WHEN %s THEN NOW() ELSE theme_updated_at END,
                         telegram_enabled = COALESCE(%s, telegram_enabled),
-                        whatsapp_enabled = COALESCE(%s, whatsapp_enabled)
+                        whatsapp_enabled = COALESCE(%s, whatsapp_enabled),
+                        teams_webhook_url = COALESCE(%s, teams_webhook_url),
+                        teams_enabled    = COALESCE(%s, teams_enabled)
                     WHERE email = %s AND is_verified = 1""",
                     (name, _val('phone'), _val('gmail_address'),
                      _val('telegram_chat_id'), _val('green_api_instance'),
@@ -2390,6 +2399,7 @@ def update_user_settings():
                      avatar, theme_color, font_family, theme_mode, theme_secondary,
                      bool(theme_color or font_family or theme_mode or theme_secondary),
                      _bool_val('telegram_enabled'), _bool_val('whatsapp_enabled'),
+                     _val('teams_webhook_url'), _bool_val('teams_enabled'),
                      email)
                 )
             else:
@@ -2408,7 +2418,9 @@ def update_user_settings():
                         theme_secondary  = COALESCE(%s, theme_secondary),
                         theme_updated_at = CASE WHEN %s THEN NOW() ELSE theme_updated_at END,
                         telegram_enabled = COALESCE(%s, telegram_enabled),
-                        whatsapp_enabled = COALESCE(%s, whatsapp_enabled)
+                        whatsapp_enabled = COALESCE(%s, whatsapp_enabled),
+                        teams_webhook_url = COALESCE(%s, teams_webhook_url),
+                        teams_enabled    = COALESCE(%s, teams_enabled)
                     WHERE email = %s AND is_verified = 1""",
                     (name, _val('phone'), _val('gmail_address'),
                      _val('telegram_chat_id'), _val('green_api_instance'),
@@ -2416,6 +2428,7 @@ def update_user_settings():
                      avatar, theme_color, font_family, theme_mode, theme_secondary,
                      bool(theme_color or font_family or theme_mode or theme_secondary),
                      _bool_val('telegram_enabled'), _bool_val('whatsapp_enabled'),
+                     _val('teams_webhook_url'), _bool_val('teams_enabled'),
                      email)
                 )
         db.commit()
@@ -2863,6 +2876,39 @@ def _send_telegram_notification(chat_id, sender, subject, snippet, user_email, c
         print(f"[Monitor] Telegram exception: {e}")
 
 
+def _send_teams_notification(webhook_url, sender, subject, snippet, category='normal'):
+    if not webhook_url:
+        return
+    match = re.match(r'^(.+?)\s*<', sender)
+    sender_name = match.group(1).strip().strip('"') if match else sender.split('@')[0]
+    cat_labels = {
+        'important':  '🔴 Important',
+        'newsletter': '🟡 Newsletter',
+        'normal':     '🔵 Normal',
+    }
+    cat_label = cat_labels.get(category, '🔵 Normal')
+    card = {
+        "@type": "MessageCard",
+        "@context": "http://schema.org/extensions",
+        "themeColor": "0078D4",
+        "summary": f"Nouveau mail : {subject}",
+        "sections": [{
+            "activityTitle": f"📬 MailNotifier — {cat_label}",
+            "activitySubtitle": f"De : {sender_name}",
+            "activityText": f"**{subject}**\n\n{snippet[:200]}",
+            "markdown": True
+        }]
+    }
+    try:
+        resp = requests.post(webhook_url, json=card, timeout=10)
+        if resp.ok:
+            print(f"[Monitor] Teams OK → {webhook_url[:40]}...")
+        else:
+            print(f"[Monitor] Teams erreur: {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        print(f"[Monitor] Teams exception: {e}")
+
+
 def _save_last_uid(user_id, uid):
     db = get_db()
     try:
@@ -2969,6 +3015,9 @@ def _check_user_emails_gmail(user):
                         thread_id = msg.get('threadId', '')
                         _send_whatsapp_notification(user, sender, subject, snippet, category,
                                                     gmail_message_id=msg_id, gmail_thread_id=thread_id)
+
+                    if user.get('teams_webhook_url') and user.get('teams_enabled', True):
+                        _send_teams_notification(user['teams_webhook_url'], sender, subject, snippet, category)
 
                     match_s = re.match(r'^(.+?)\s*<', sender)
                     sender_name = match_s.group(1).strip().strip('"') if match_s else sender.split('@')[0]
