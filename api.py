@@ -2881,43 +2881,12 @@ def _send_teams_notification(webhook_url, sender, subject, snippet, category='no
         return
     match = re.match(r'^(.+?)\s*<', sender)
     sender_name = match.group(1).strip().strip('"') if match else sender.split('@')[0]
-    cat_colors = {'important': 'attention', 'newsletter': 'warning', 'normal': 'accent'}
     cat_labels = {'important': '🔴 Important', 'newsletter': '🟡 Newsletter', 'normal': '🔵 Normal'}
     cat_label = cat_labels.get(category, '🔵 Normal')
-    cat_color = cat_colors.get(category, 'accent')
-    # Adaptive Card format — compatible Power Automate Workflows webhook
+    # Format texte simple — compatible Power Automate "Envoyer des alertes webhook à un canal"
     card = {
-        "type": "message",
-        "attachments": [{
-            "contentType": "application/vnd.microsoft.card.adaptive",
-            "content": {
-                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                "type": "AdaptiveCard",
-                "version": "1.2",
-                "body": [
-                    {
-                        "type": "TextBlock",
-                        "text": f"📬 MailNotifier — {cat_label}",
-                        "weight": "Bolder",
-                        "size": "Medium",
-                        "color": cat_color
-                    },
-                    {
-                        "type": "FactSet",
-                        "facts": [
-                            {"title": "De", "value": sender_name},
-                            {"title": "Objet", "value": subject}
-                        ]
-                    },
-                    {
-                        "type": "TextBlock",
-                        "text": snippet[:300],
-                        "wrap": True,
-                        "isSubtle": True
-                    }
-                ]
-            }
-        }]
+        "title": f"📬 MailNotifier — {cat_label}",
+        "text": f"**De :** {sender_name}\n\n**Objet :** {subject}\n\n{snippet[:300]}"
     }
     try:
         resp = requests.post(webhook_url, json=card, timeout=10)
