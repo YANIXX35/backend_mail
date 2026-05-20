@@ -3696,11 +3696,10 @@ def chat_bot():
         return Response(stream_with_context(_sse(_keyword_fallback(message))),
                         headers=sse_headers)
 
-    # RÈGLE : toujours v1beta (system_instruction n'existe pas en v1)
-    # gemini-2.0-flash → gemini-2.0-flash-lite en fallback (1500 req/jour chacun)
+    # Modèles disponibles dans le projet YANISSE (confirmé via AI Studio)
     GEMINI_MODELS = [
-        'gemini-2.0-flash',
-        'gemini-2.0-flash-lite',
+        'gemini-2.5-flash-lite',
+        'gemini-2.5-flash',
     ]
 
     def _call_gemini_cached():
