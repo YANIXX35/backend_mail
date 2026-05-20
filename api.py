@@ -3075,13 +3075,16 @@ def _check_all_users():
                 SELECT id, email, telegram_chat_id, last_history_id,
                        fcm_token, phone, whatsapp_chat_id,
                        COALESCE(telegram_enabled, TRUE) AS telegram_enabled,
-                       COALESCE(whatsapp_enabled, TRUE) AS whatsapp_enabled
+                       COALESCE(whatsapp_enabled, TRUE) AS whatsapp_enabled,
+                       COALESCE(teams_webhook_url, '') AS teams_webhook_url,
+                       COALESCE(teams_enabled, TRUE) AS teams_enabled
                 FROM users
                 WHERE gmail_refresh_token IS NOT NULL
                   AND (
                     (telegram_chat_id IS NOT NULL AND telegram_chat_id != '')
                     OR fcm_token IS NOT NULL
                     OR (phone IS NOT NULL AND phone != '')
+                    OR (teams_webhook_url IS NOT NULL AND teams_webhook_url != '')
                   )
                   AND is_verified = 1
             """)
