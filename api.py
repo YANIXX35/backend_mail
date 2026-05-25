@@ -259,6 +259,47 @@ def token_required(f):
     
     return decorated
 
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            if auth_header.startswith('Bearer '):
+                token = auth_header.split(' ')[1]
+        if not token:
+            return jsonify({'error': 'Token JWT requis'}), 401
+        db = None
+        try:
+            payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+            user_id = payload['user_id']
+            user_email = payload['email']
+            db = get_db()
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT id, email, role FROM users WHERE id = %s AND email = %s AND is_verified = 1",
+                    (user_id, user_email)
+                )
+                user = cur.fetchone()
+            if not user:
+                return jsonify({'error': 'Utilisateur non trouvé'}), 401
+            if user.get('role') != 'admin':
+                return jsonify({'error': 'Accès refusé — Admin requis'}), 403
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'Token expiré'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'error': 'Token invalide'}), 401
+        except Exception as e:
+            print(f"[ADMIN AUTH] {e}")
+            return jsonify({'error': 'Erreur de validation'}), 401
+        finally:
+            if db:
+                _return_db(db)
+        request.current_user = {'id': user_id, 'email': user_email}
+        return f(*args, **kwargs)
+    return decorated
+
+
 def generate_token(user_id: int, email: str) -> str:
     """Génère un token JWT pour l'utilisateur."""
     payload = {
@@ -864,6 +905,7 @@ def login():
 # ─── ADMIN ROUTES ─────────────────────────────────────────────────────────────
 
 @app.route('/api/admin/stats')
+@admin_required
 def admin_stats():
     db = get_db()
     try:
@@ -895,6 +937,7 @@ def admin_stats():
 
 
 @app.route('/api/admin/users', methods=['GET'])
+@admin_required
 def admin_get_users():
     db = get_db()
     try:
@@ -922,6 +965,7 @@ def admin_get_users():
 
 
 @app.route('/api/admin/users/<int:user_id>', methods=['PUT'])
+@admin_required
 def admin_update_user(user_id):
     data = request.json
     db = get_db()
@@ -939,6 +983,7 @@ def admin_update_user(user_id):
 
 
 @app.route('/api/admin/users/<int:user_id>', methods=['DELETE'])
+@admin_required
 def admin_delete_user(user_id):
     db = get_db()
     try:
@@ -951,6 +996,7 @@ def admin_delete_user(user_id):
 
 
 @app.route('/api/admin/users', methods=['POST'])
+@admin_required
 def admin_create_user():
     data = request.json
     db = get_db()
@@ -970,6 +1016,7 @@ def admin_create_user():
 
 
 @app.route('/api/admin/payments', methods=['GET'])
+@admin_required
 def admin_get_payments():
     db = get_db()
     try:
@@ -995,6 +1042,7 @@ def admin_get_payments():
 
 
 @app.route('/api/admin/payments', methods=['POST'])
+@admin_required
 def admin_create_payment():
     data = request.json
     db = get_db()
@@ -1014,6 +1062,7 @@ def admin_create_payment():
 
 
 @app.route('/api/admin/payments/<int:pay_id>', methods=['DELETE'])
+@admin_required
 def admin_delete_payment(pay_id):
     db = get_db()
     try:
@@ -1026,6 +1075,7 @@ def admin_delete_payment(pay_id):
 
 
 @app.route('/api/admin/whatsapp-diagnostic', methods=['GET'])
+@admin_required
 def admin_whatsapp_diagnostic():
     """Diagnostic complet WhatsApp pour tous les utilisateurs configurés."""
     db = get_db()
@@ -1128,6 +1178,7 @@ def admin_whatsapp_diagnostic():
 
 
 @app.route('/api/admin/whatsapp-fix-chat-ids', methods=['POST'])
+@admin_required
 def admin_fix_chat_ids():
     """Résout et sauvegarde les whatsapp_chat_id manquants pour tous les users."""
     db = get_db()
@@ -1172,6 +1223,7 @@ def admin_fix_chat_ids():
 
 
 @app.route('/api/admin/users/<int:user_id>/suspend', methods=['PATCH'])
+@admin_required
 def admin_suspend_user(user_id):
     data = request.json or {}
     suspended = bool(data.get('is_suspended', False))
@@ -1189,6 +1241,7 @@ def admin_suspend_user(user_id):
 
 
 @app.route('/api/admin/users/<path:email>/emails', methods=['GET'])
+@admin_required
 def admin_get_user_emails(email):
     """Recupere les emails Gmail d'un utilisateur specifique (acces admin)."""
     db = get_db()
@@ -1240,6 +1293,7 @@ def admin_get_user_emails(email):
 
 
 @app.route('/api/admin/gmail-scope-status', methods=['GET'])
+@admin_required
 def admin_gmail_scope_status():
     """Liste tous les utilisateurs avec Gmail OAuth connecté + leur statut de scope v2."""
     db = get_db()
@@ -1262,6 +1316,7 @@ def admin_gmail_scope_status():
 
 
 @app.route('/api/admin/reset-gmail-scope', methods=['POST'])
+@admin_required
 def admin_reset_gmail_scope():
     """Remet gmail_scope_v2=FALSE pour forcer la reconnexion (pour 1 user ou tous)."""
     data = request.json or {}
@@ -1439,7 +1494,12 @@ def gmail_oauth_callback():
             with db.cursor() as cur:
                 # Vérifier si le scope gmail.send est inclus dans les scopes accordés
                 granted_scopes = getattr(creds, 'scopes', None) or []
-                has_send_scope = any('gmail.send' in s for s in granted_scopes)
+                if granted_scopes:
+                    has_send_scope = any('gmail.send' in s for s in granted_scopes)
+                else:
+                    # Google ne retourne pas toujours les scopes dans la réponse token.
+                    # On a demandé gmail.send dans GMAIL_SCOPES → on suppose qu'il est accordé.
+                    has_send_scope = True
 
                 cur.execute(
                     """UPDATE users SET
@@ -3494,110 +3554,11 @@ def handle_keep_alive():
     })
 
 @app.route('/api/dashboard/advanced-stats', methods=['GET'])
+@token_required
 @limiter.limit("20 per minute")
 def get_advanced_stats():
     """Endpoint pour récupérer les statistiques avancées du tableau de bord."""
-    email = request.args.get('email')
-    period = int(request.args.get('period', 30))  # jours
-    status = request.args.get('status', 'all')
-    sender_filter = request.args.get('sender', '')
-    start_date = request.args.get('start_date')
-    end_date = request.args.get('end_date')
-    
-    if not email:
-        return jsonify({'error': 'Email requis'}), 400
-    
-    try:
-        db = get_db()
-        with db.cursor() as cur:
-            # Statistiques générales
-            cur.execute("""
-                SELECT 
-                    COUNT(*) as total_emails,
-                    SUM(CASE WHEN is_read = false THEN 1 ELSE 0 END) as unread_emails,
-                    SUM(CASE WHEN is_sent = true THEN 1 ELSE 0 END) as sent_emails,
-                    DATE(sent_at) as last_email_date
-                FROM emails 
-                WHERE user_email = %s
-            """, (email,))
-            
-            stats = cur.fetchone()
-            
-            # Évolution temporelle
-            cur.execute("""
-                SELECT 
-                    DATE(sent_at) as date,
-                    COUNT(*) as count,
-                    SUM(CASE WHEN is_read = false THEN 1 ELSE 0 END) as unread
-                FROM emails 
-                WHERE user_email = %s 
-                    AND sent_at >= CURRENT_DATE - INTERVAL '%s days'
-                GROUP BY DATE(sent_at)
-                ORDER BY date DESC
-            """, (email, period))
-            
-            evolution = cur.fetchall()
-            
-            # Répartition par statut
-            cur.execute("""
-                SELECT 
-                    CASE WHEN is_read = true THEN 'Lus' ELSE 'Non lus' END as status,
-                    COUNT(*) as count
-                FROM emails 
-                WHERE user_email = %s
-                GROUP BY is_read
-            """, (email,))
-            
-            status_distribution = cur.fetchall()
-            
-            # Top expéditeurs
-            cur.execute("""
-                SELECT 
-                    sender,
-                    COUNT(*) as count
-                FROM emails 
-                WHERE user_email = %s
-                    AND sender IS NOT NULL
-                GROUP BY sender
-                ORDER BY count DESC
-                LIMIT 10
-            """, (email,))
-            
-            top_senders = cur.fetchall()
-            
-        return jsonify({
-            'total_emails': int(stats['total_emails'] or 0),
-            'unread_emails': int(stats['unread_emails'] or 0),
-            'sent_emails': int(stats['sent_emails'] or 0),
-            'average_per_day': round(int(stats['total_emails'] or 0) / period, 1),
-            'evolution': [
-                {
-                    'date': str(row['date']),
-                    'count': int(row['count']),
-                    'unread': int(row['unread'])
-                } for row in evolution
-            ],
-            'status_distribution': [
-                {
-                    'status': row['status'],
-                    'count': int(row['count'])
-                } for row in status_distribution
-            ],
-            'top_senders': [
-                {
-                    'sender': row['sender'],
-                    'count': int(row['count'])
-                } for row in top_senders
-            ]
-        }), 200
-        
-    except Exception as e:
-        print(f"[ERROR] Advanced stats: {e}")
-        return jsonify({'error': 'Erreur lors de la récupération des statistiques'}), 500
-        
-    finally:
-        if 'db' in locals():
-            db.close()
+    return jsonify({'error': 'Statistiques avancées non disponibles dans cette version'}), 501
 
 
 def init_user_preferences():
