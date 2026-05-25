@@ -3005,10 +3005,6 @@ def _check_user_emails_gmail(user):
                         _send_whatsapp_notification(user, sender, subject, snippet, category,
                                                     gmail_message_id=msg_id, gmail_thread_id=thread_id)
 
-                    print(f"[Monitor] Teams debug → url={repr(user.get('teams_webhook_url', '')[:40])} enabled={user.get('teams_enabled')}")
-                    if user.get('teams_webhook_url') and user.get('teams_enabled', True):
-                        _send_teams_notification(user['teams_webhook_url'], sender, subject, snippet, category)
-
                     match_s = re.match(r'^(.+?)\s*<', sender)
                     sender_name = match_s.group(1).strip().strip('"') if match_s else sender.split('@')[0]
                     fcm_token = user.get('fcm_token')
