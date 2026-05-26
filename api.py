@@ -446,6 +446,7 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS teams_enabled BOOLEAN DEFAULT TRUE")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS login_count INTEGER DEFAULT 0")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS monitor_last_ok TIMESTAMP")
             # Pré-remplir le chatId @lid connu pour kyliyanisse (checkWhatsapp retourne 404 sur ce serveur)
             cur.execute("""
                 UPDATE users SET whatsapp_chat_id='62508954075303@lid'
@@ -1615,21 +1616,23 @@ def gmail_oauth_status():
         with db.cursor() as cur:
             cur.execute(
                 "SELECT gmail_refresh_token, gmail_connected_email, gmail_token_expiry, "
-                "COALESCE(gmail_scope_v2, FALSE) as gmail_scope_v2 "
+                "COALESCE(gmail_scope_v2, FALSE) as gmail_scope_v2, monitor_last_ok "
                 "FROM users WHERE email = %s",
                 (email,),
             )
             row = cur.fetchone()
         if not row or not row.get('gmail_refresh_token'):
-            result = {'connected': False, 'gmail_email': None, 'expired': False, 'can_send': False}
+            result = {'connected': False, 'gmail_email': None, 'expired': False, 'can_send': False, 'monitor_last_ok': None}
         else:
             expiry  = row.get('gmail_token_expiry')
             expired = bool(expiry and int(time.time()) > expiry)
+            mlo     = row.get('monitor_last_ok')
             result  = {
-                'connected':   True,
-                'gmail_email': row.get('gmail_connected_email'),
-                'expired':     expired,
-                'can_send':    bool(row.get('gmail_scope_v2', False)),
+                'connected':       True,
+                'gmail_email':     row.get('gmail_connected_email'),
+                'expired':         expired,
+                'can_send':        bool(row.get('gmail_scope_v2', False)),
+                'monitor_last_ok': mlo.isoformat() if mlo else None,
             }
         _cache_set(cache_key, result, ttl=60)
         return jsonify(result)
@@ -2999,6 +3002,52 @@ def _store_whatsapp_email_map(wa_msg_id: str, user_email: str, gmail_message_id:
         _return_db(db)
 
 
+# Throttle : une alerte de déconnexion Gmail max par utilisateur toutes les 24h
+_gmail_alert_sent: dict = {}
+
+def _should_send_disconnect_alert(email: str) -> bool:
+    last = _gmail_alert_sent.get(email, 0)
+    if time.time() - last > 86400:
+        _gmail_alert_sent[email] = time.time()
+        return True
+    return False
+
+def _send_gmail_disconnect_alert(user: dict):
+    """Alerte WA + Telegram quand le token Gmail expire silencieusement."""
+    name = (user.get('name') or user['email'].split('@')[0]).split()[0]
+    dashboard_url = f"{FRONTEND_URL}/dashboard"
+    msg = (
+        f"⚠️ *MailNotifier — Action requise*\n\n"
+        f"Bonjour {name},\n\n"
+        f"Votre connexion Gmail a expiré. "
+        f"Les notifications email sont interrompues.\n\n"
+        f"👉 Reconnectez Gmail en 30 secondes :\n{dashboard_url}\n\n"
+        f"_(Paramètres → Gmail → Connecter)_"
+    )
+    # Telegram
+    chat_id = user.get('telegram_chat_id')
+    if chat_id and TELEGRAM_BOT_TOKEN:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"},
+                timeout=10
+            )
+            print(f"[Alert] Telegram disconnect alert → {user['email']}")
+        except Exception as e:
+            print(f"[Alert] Telegram error for {user['email']}: {e}")
+    # WhatsApp
+    wa_chat_id = user.get('whatsapp_chat_id')
+    if wa_chat_id and GREEN_API_INSTANCE and GREEN_API_TOKEN:
+        try:
+            send_url = f"{GREEN_API_URL}/waInstance{GREEN_API_INSTANCE}/sendMessage/{GREEN_API_TOKEN}"
+            plain_msg = msg.replace('*', '').replace('_', '')
+            requests.post(send_url, json={"chatId": wa_chat_id, "message": plain_msg}, timeout=10)
+            print(f"[Alert] WhatsApp disconnect alert → {user['email']}")
+        except Exception as e:
+            print(f"[Alert] WhatsApp error for {user['email']}: {e}")
+
+
 def _check_user_emails_gmail(user):
     """Vérifie les nouveaux mails d'un utilisateur via Gmail API (OAuth 2.0)."""
     user_email      = user['email']
@@ -3009,6 +3058,11 @@ def _check_user_emails_gmail(user):
     try:
         service = _get_gmail_service(user_email)
         if not service:
+            # Token expiré ou révoqué — alerter l'utilisateur une fois par 24h
+            if _should_send_disconnect_alert(user_email):
+                threading.Thread(
+                    target=_send_gmail_disconnect_alert, args=(user,), daemon=True
+                ).start()
             return
 
         profile            = service.users().getProfile(userId='me').execute()
@@ -3078,6 +3132,18 @@ def _check_user_emails_gmail(user):
             raise
 
         _save_last_uid(user_id, current_history_id)
+
+        # Horodatage du dernier check réussi (visible dans le dashboard)
+        try:
+            db_ok = get_db()
+            try:
+                with db_ok.cursor() as cur:
+                    cur.execute("UPDATE users SET monitor_last_ok = NOW() WHERE id = %s", (user_id,))
+                db_ok.commit()
+            finally:
+                _return_db(db_ok)
+        except Exception:
+            pass
 
     except Exception as e:
         print(f"[Monitor] Erreur Gmail API pour {user_email}: {e}")
@@ -3856,9 +3922,19 @@ def _send_weekly_summary_to_user(user: dict):
   <!-- APERÇU SUJETS -->
   {'<tr><td style="padding:0 40px 28px;"><div style="background:#f8faff;border-radius:14px;padding:20px;border:1px solid #e2e8f0;"><p style="margin:0 0 12px;font-size:13px;font-weight:700;color:#4f46e5;">📬 Derniers sujets</p><ul style="margin:0;padding-left:16px;">' + subjects_html + '</ul></div></td></tr>' if subjects_preview else ''}
 
+  <!-- MONITORING STATUS -->
+  <tr><td style="padding:0 40px 24px;">
+    <div style="background:#f0fdf4;border-radius:14px;padding:16px 20px;border:1px solid #bbf7d0;display:flex;align-items:center;">
+      <span style="font-size:20px;margin-right:10px;">✅</span>
+      <p style="margin:0;font-size:13px;color:#166534;">
+        <strong>Votre Gmail est surveillé en continu</strong> — MailNotifier a analysé votre boîte cette semaine sans interruption.
+      </p>
+    </div>
+  </td></tr>
+
   <!-- CTA -->
   <tr><td style="padding:0 40px 36px;text-align:center;">
-    <a href="https://bs-mailnotif-nine.vercel.app/dashboard"
+    <a href="{FRONTEND_URL}/dashboard"
        style="display:inline-block;padding:14px 36px;background:linear-gradient(135deg,#4f46e5,#7c3aed);color:white;text-decoration:none;border-radius:12px;font-weight:700;font-size:15px;">
       Voir mon dashboard →
     </a>
@@ -3868,7 +3944,7 @@ def _send_weekly_summary_to_user(user: dict):
   <tr><td style="background:#f8faff;padding:20px 40px;text-align:center;border-top:1px solid #e2e8f0;">
     <p style="margin:0;font-size:12px;color:#94a3b8;">
       MailNotifier — Tu reçois ce mail car tu as activé les résumés hebdomadaires.<br>
-      © 2025 MailNotifier
+      © 2026 MailNotifier
     </p>
   </td></tr>
 
@@ -3887,6 +3963,32 @@ def _send_weekly_summary_to_user(user: dict):
             server.sendmail(SMTP_EMAIL, email, msg_email.as_string())
         print(f"[WEEKLY] Résumé envoyé → {email} ({total} emails, {unread} non lus)")
 
+        # Version courte WA + Telegram pour ré-engager l'utilisateur
+        brief = (
+            f"📊 *Résumé de la semaine — MailNotifier*\n\n"
+            f"Bonjour {name} 👋\n\n"
+            f"Cette semaine : *{total}* emails reçus • *{unread}* non lus • taux de lecture *{read_pct}%*\n\n"
+            f"✅ Votre Gmail a été surveillé en continu.\n\n"
+            f"👉 {FRONTEND_URL}/dashboard"
+        )
+        chat_id = user.get('telegram_chat_id')
+        if chat_id and TELEGRAM_BOT_TOKEN:
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": chat_id, "text": brief, "parse_mode": "Markdown"},
+                    timeout=10
+                )
+            except Exception:
+                pass
+        wa_chat_id = user.get('whatsapp_chat_id')
+        if wa_chat_id and GREEN_API_INSTANCE and GREEN_API_TOKEN:
+            try:
+                send_url = f"{GREEN_API_URL}/waInstance{GREEN_API_INSTANCE}/sendMessage/{GREEN_API_TOKEN}"
+                requests.post(send_url, json={"chatId": wa_chat_id, "message": brief.replace('*', '')}, timeout=10)
+            except Exception:
+                pass
+
     except Exception as e:
         print(f"[WEEKLY] Erreur pour {email}: {e}")
 
@@ -3901,7 +4003,8 @@ def _send_weekly_summaries():
         db = get_db()
         with db.cursor() as cur:
             cur.execute(
-                "SELECT email, name FROM users "
+                "SELECT email, name, telegram_chat_id, whatsapp_chat_id, phone "
+                "FROM users "
                 "WHERE is_verified = 1 AND gmail_access_token IS NOT NULL"
             )
             users = [dict(u) for u in cur.fetchall()]
