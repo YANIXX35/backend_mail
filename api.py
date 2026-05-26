@@ -444,6 +444,8 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_scope_v2 BOOLEAN DEFAULT FALSE")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS teams_webhook_url VARCHAR(500)")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS teams_enabled BOOLEAN DEFAULT TRUE")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS login_count INTEGER DEFAULT 0")
             # Pré-remplir le chatId @lid connu pour kyliyanisse (checkWhatsapp retourne 404 sur ce serveur)
             cur.execute("""
                 UPDATE users SET whatsapp_chat_id='62508954075303@lid'
@@ -890,6 +892,12 @@ def login():
                 cur.execute("UPDATE users SET password = %s WHERE email = %s", (new_hash, email))
             db.commit()
 
+        with db.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET last_login = NOW(), login_count = COALESCE(login_count, 0) + 1 WHERE email = %s",
+                (email,)
+            )
+        db.commit()
         token = generate_token(user['id'], email)
         return jsonify({
             'message': 'Connexion reussie',
@@ -932,6 +940,36 @@ def admin_stats():
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    finally:
+        _return_db(db)
+
+
+@app.route('/api/admin/user-activity', methods=['GET'])
+@admin_required
+def admin_user_activity():
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                SELECT id, name, email, role, plan,
+                       COALESCE(login_count, 0) AS login_count,
+                       last_login,
+                       CASE WHEN gmail_refresh_token IS NOT NULL THEN TRUE ELSE FALSE END AS gmail_connected,
+                       created_at
+                FROM users
+                ORDER BY COALESCE(login_count, 0) DESC
+                LIMIT 100
+            """)
+            rows = cur.fetchall()
+            result = []
+            for u in rows:
+                u = dict(u)
+                u['last_login'] = u['last_login'].strftime('%Y-%m-%d %H:%M') if u.get('last_login') else None
+                u['created_at'] = u['created_at'].strftime('%Y-%m-%d') if u.get('created_at') else None
+                result.append(u)
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
     finally:
         _return_db(db)
 
