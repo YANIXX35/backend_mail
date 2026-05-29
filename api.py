@@ -1257,12 +1257,18 @@ def admin_whatsapp_diagnostic():
             fully_operational  = can_receive_notif and can_reply and monitor_ok
 
             issues = []
-            if not has_phone:         issues.append('phone manquant')
-            if not gmail_ok:          issues.append('Gmail non connecté')
-            if not monitor_ok:        issues.append('surveillance non initialisée')
-            if not resolved_chat_id:  issues.append('whatsapp_chat_id non résolu')
-            if not wa_enabled:        issues.append('WhatsApp désactivé par l\'utilisateur')
-            if not GREEN_API_INSTANCE: issues.append('GREEN_API_INSTANCE manquant (côté serveur)')
+            if not has_phone:
+                issues.append('phone manquant')
+            if not gmail_ok:
+                issues.append('Gmail non connecté')
+            if not monitor_ok:
+                issues.append('surveillance non initialisée')
+            if not resolved_chat_id:
+                issues.append('whatsapp_chat_id non résolu')
+            if not wa_enabled:
+                issues.append('WhatsApp désactivé par l\'utilisateur')
+            if not GREEN_API_INSTANCE:
+                issues.append('GREEN_API_INSTANCE manquant (côté serveur)')
 
             report.append({
                 'id':              u['id'],
@@ -1298,7 +1304,8 @@ def admin_whatsapp_diagnostic():
             'users': report
         }), 200
     except Exception as e:
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
     finally:
         _return_db(db)
@@ -1402,7 +1409,8 @@ def admin_get_user_emails(email):
         messages = result.get('messages', [])
         emails_out = []
         for m in messages:
-            msg = service.users().messages().get(userId='me', id=m['id'], format='metadata',
+            msg = service.users().messages().get(
+                userId='me', id=m['id'], format='metadata',
                 metadataHeaders=['From', 'Subject', 'Date']).execute()
             headers = {h['name']: h['value'] for h in msg.get('payload', {}).get('headers', [])}
             labels = msg.get('labelIds', [])
@@ -2137,7 +2145,7 @@ def whatsapp_webhook():
                 if handled:
                     return jsonify({'status': 'command_handled'}), 200
             else:
-                print(f"[WEBHOOK] Commande ignorée — chat_id ou user_email manquant")
+                print("[WEBHOOK] Commande ignorée — chat_id ou user_email manquant")
 
         # ── Résoudre templates numériques (1-6 défaut + 7-10 custom) ──────────
         quoted = msg_data.get('quotedMessage')
@@ -2303,12 +2311,6 @@ def ai_analyze():
                 "newsletter_count": 0, "normal_count": 0,
                 "actions": [], "emails": [],
             })
-
-        emails_text = "\n".join(
-            f"[{i+1}] ID:{e['id']} | De: {e['sender']} | Objet: {e['subject']} | "
-            f"{'NON LU' if e['unread'] else 'Lu'} | Apercu: {e['snippet']}"
-            for i, e in enumerate(emails_data)
-        )
 
         # Gemini désactivé — quota réservé au chatbot uniquement
         # Analyse statique basée sur les emails lus (sans appel API)
