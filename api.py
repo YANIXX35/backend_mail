@@ -210,17 +210,9 @@ if _gcsj and (not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET):
         GOOGLE_CLIENT_SECRET = GOOGLE_CLIENT_SECRET or _web.get('client_secret', '')
     except Exception:
         pass
-OAUTH_REDIRECT_URI        = os.getenv('OAUTH_REDIRECT_URI', 'https://backend-mail-1.onrender.com/api/gmail/callback')
-GOOGLE_SIGNUP_REDIRECT_URI = os.getenv('GOOGLE_SIGNUP_REDIRECT_URI', 'https://backend-mail-1.onrender.com/api/auth/google/callback')
-FRONTEND_URL              = os.getenv('FRONTEND_URL', 'https://notifymails.com')
-GMAIL_SCOPES              = [
-    'https://www.googleapis.com/auth/gmail.readonly',
-    'https://www.googleapis.com/auth/gmail.send',
-]
-GOOGLE_SIGNUP_SCOPES = [
-    'openid',
-    'https://www.googleapis.com/auth/userinfo.email',
-    'https://www.googleapis.com/auth/userinfo.profile',
+OAUTH_REDIRECT_URI = os.getenv('OAUTH_REDIRECT_URI', 'https://backend-mail-1.onrender.com/api/gmail/callback')
+FRONTEND_URL       = os.getenv('FRONTEND_URL', 'https://notifymails.com')
+GMAIL_SCOPES       = [
     'https://www.googleapis.com/auth/gmail.readonly',
     'https://www.googleapis.com/auth/gmail.send',
 ]
@@ -1007,58 +999,18 @@ def google_login():
         _return_db(db)
 
 
-@app.route('/api/auth/google')
-def google_signup_start():
-    """Initie le flow OAuth2 Google unifié: identité + Gmail en un seul clic."""
-    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-        return redirect(f"{FRONTEND_URL}?google_error=oauth_not_configured")
-
-    state = jwt.encode(
-        {'mode': 'signup', 'iat': int(time.time()), 'exp': int(time.time()) + 600},
-        JWT_SECRET_KEY,
-        algorithm=JWT_ALGORITHM
-    )
-    config = {
-        "web": {
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": [GOOGLE_SIGNUP_REDIRECT_URI],
-        }
-    }
-    flow = Flow.from_client_config(config, scopes=GOOGLE_SIGNUP_SCOPES, redirect_uri=GOOGLE_SIGNUP_REDIRECT_URI)
-    auth_url, _ = flow.authorization_url(
-        access_type='offline',
-        prompt='consent',
-        include_granted_scopes='true',
-        state=state,
-    )
-    return redirect(auth_url)
-
-
-@app.route('/api/auth/google/callback')
-def google_signup_callback():
-    """Callback OAuth2 unifié — crée/connecte le compte ET stocke les tokens Gmail."""
-    from urllib.parse import quote as _quote
+@app.route('/api/auth/google-code', methods=['POST'])
+@limiter.limit("10 per minute")
+def google_code_login():
+    """Échange un code GIS (google.accounts.oauth2) contre un JWT — scopes identité seulement."""
     import secrets as _sec
+    data = request.json or {}
+    code = data.get('code', '')
 
-    error = request.args.get('error')
-    if error:
-        return redirect(f"{FRONTEND_URL}?google_error={error}")
-
-    code  = request.args.get('code')
-    state = request.args.get('state')
-    if not code or not state:
-        return redirect(f"{FRONTEND_URL}?google_error=missing_params")
-
-    try:
-        payload = jwt.decode(state, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
-        if payload.get('mode') != 'signup':
-            raise ValueError('invalid mode')
-    except Exception as e:
-        print(f"[Google Signup] State invalid: {e}")
-        return redirect(f"{FRONTEND_URL}?google_error=state_invalid")
+    if not code:
+        return jsonify({'error': 'Code Google manquant'}), 400
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        return jsonify({'error': 'Google OAuth non configuré'}), 500
 
     try:
         config = {
@@ -1067,98 +1019,73 @@ def google_signup_callback():
                 "client_secret": GOOGLE_CLIENT_SECRET,
                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                 "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": [GOOGLE_SIGNUP_REDIRECT_URI],
+                "redirect_uris": ["postmessage"],
             }
         }
-        flow = Flow.from_client_config(config, scopes=GOOGLE_SIGNUP_SCOPES, redirect_uri=GOOGLE_SIGNUP_REDIRECT_URI)
+        flow = Flow.from_client_config(
+            config,
+            scopes=[
+                'openid',
+                'https://www.googleapis.com/auth/userinfo.email',
+                'https://www.googleapis.com/auth/userinfo.profile',
+            ],
+            redirect_uri='postmessage',
+        )
         flow.fetch_token(code=code)
         creds = flow.credentials
 
         userinfo_resp = requests.get(
             'https://www.googleapis.com/oauth2/v3/userinfo',
             headers={'Authorization': f'Bearer {creds.token}'},
-            timeout=10
+            timeout=10,
         )
         userinfo     = userinfo_resp.json()
         google_email = userinfo.get('email', '').lower()
         google_name  = userinfo.get('name', '') or google_email.split('@')[0]
         if not google_email:
-            return redirect(f"{FRONTEND_URL}?google_error=no_email")
+            return jsonify({'error': 'Email Google non disponible'}), 400
+    except Exception as e:
+        print(f"[Google Code] Échange échoué: {e}")
+        return jsonify({'error': 'Code Google invalide ou expiré'}), 401
 
-        gmail_svc   = build('gmail', 'v1', credentials=creds)
-        profile     = gmail_svc.users().getProfile(userId='me').execute()
-        gmail_email = profile.get('emailAddress', google_email)
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE email = %s", (google_email,))
+            user = cur.fetchone()
 
-        expiry_ts      = int(creds.expiry.timestamp()) if creds.expiry else None
-        granted_scopes = getattr(creds, 'scopes', None) or []
-        has_send_scope = any('gmail.send' in s for s in granted_scopes) if granted_scopes else True
-
-        db = get_db()
-        try:
+        if user:
+            with db.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET last_login = NOW(), login_count = COALESCE(login_count, 0) + 1 WHERE email = %s",
+                    (google_email,)
+                )
+            db.commit()
+        else:
+            rand_pw = hash_password(_sec.token_urlsafe(32))
+            with db.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO users
+                       (name, email, password, gmail_address, is_verified, plan, created_at, last_login, login_count)
+                       VALUES (%s, %s, %s, %s, 1, 'free', NOW(), NOW(), 1)""",
+                    (google_name, google_email, rand_pw, google_email)
+                )
+            db.commit()
             with db.cursor() as cur:
                 cur.execute("SELECT * FROM users WHERE email = %s", (google_email,))
-                existing = cur.fetchone()
+                user = cur.fetchone()
 
-            if existing:
-                with db.cursor() as cur:
-                    cur.execute(
-                        """UPDATE users SET
-                            gmail_access_token    = %s,
-                            gmail_refresh_token   = COALESCE(%s, gmail_refresh_token),
-                            gmail_token_expiry    = %s,
-                            gmail_connected_email = %s,
-                            gmail_address         = COALESCE(NULLIF(gmail_address,''), %s),
-                            gmail_send_scope      = %s,
-                            gmail_scope_v2        = %s,
-                            last_login            = NOW(),
-                            login_count           = COALESCE(login_count, 0) + 1
-                        WHERE email = %s""",
-                        (
-                            creds.token, creds.refresh_token, expiry_ts,
-                            gmail_email, gmail_email,
-                            has_send_scope, has_send_scope,
-                            google_email,
-                        ),
-                    )
-                db.commit()
-                role = existing.get('role', 'user')
-                uid  = existing['id']
-            else:
-                rand_pw = hash_password(_sec.token_urlsafe(32))
-                with db.cursor() as cur:
-                    cur.execute(
-                        """INSERT INTO users
-                           (name, email, password, gmail_address, gmail_connected_email,
-                            gmail_access_token, gmail_refresh_token, gmail_token_expiry,
-                            gmail_send_scope, gmail_scope_v2,
-                            is_verified, plan, created_at, last_login, login_count)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1,'free',NOW(),NOW(),1)
-                           RETURNING id""",
-                        (
-                            google_name, google_email, rand_pw,
-                            gmail_email, gmail_email,
-                            creds.token, creds.refresh_token, expiry_ts,
-                            has_send_scope, has_send_scope,
-                        ),
-                    )
-                    uid = cur.fetchone()['id']
-                db.commit()
-                role = 'user'
-
-            app_token = generate_token(uid, google_email)
-            print(f"[Google Signup] {'Connexion' if existing else 'Inscription'} OK — {google_email}")
-            return redirect(
-                f"{FRONTEND_URL}?google_token={app_token}"
-                f"&gname={_quote(google_name)}"
-                f"&gemail={_quote(google_email)}"
-                f"&grole={role}"
-            )
-        finally:
-            _return_db(db)
-
-    except Exception as e:
-        print(f"[Google Signup] Callback error: {e}")
-        return redirect(f"{FRONTEND_URL}?google_error=callback_failed")
+        token = generate_token(user['id'], google_email)
+        print(f"[Google Code] {'Connexion' if user else 'Inscription'} OK — {google_email}")
+        return jsonify({
+            'message': 'Connexion reussie',
+            'name':    user['name'],
+            'email':   google_email,
+            'role':    user.get('role', 'user'),
+            'token':   token,
+        }), 200
+    finally:
+        _return_db(db)
 
 
 # ─── ADMIN ROUTES ─────────────────────────────────────────────────────────────
