@@ -1018,9 +1018,10 @@ def google_token_login():
         )
         if userinfo_resp.status_code != 200:
             return jsonify({'error': 'Token Google invalide'}), 401
-        userinfo     = userinfo_resp.json()
-        google_email = userinfo.get('email', '').lower()
-        google_name  = userinfo.get('name', '') or google_email.split('@')[0]
+        userinfo      = userinfo_resp.json()
+        google_email  = userinfo.get('email', '').lower()
+        google_name   = userinfo.get('name', '') or google_email.split('@')[0]
+        google_picture = userinfo.get('picture', '')
         if not google_email:
             return jsonify({'error': 'Email Google non disponible'}), 400
     except Exception as e:
@@ -1034,20 +1035,29 @@ def google_token_login():
             user = cur.fetchone()
 
         if user:
+            # Mise à jour login + photo Google si pas déjà de photo perso
             with db.cursor() as cur:
                 cur.execute(
-                    "UPDATE users SET last_login = NOW(), login_count = COALESCE(login_count, 0) + 1 WHERE email = %s",
-                    (google_email,)
+                    """UPDATE users SET
+                        last_login   = NOW(),
+                        login_count  = COALESCE(login_count, 0) + 1,
+                        avatar       = CASE WHEN (avatar IS NULL OR avatar = '') AND %s != ''
+                                            THEN %s ELSE avatar END
+                    WHERE email = %s""",
+                    (google_picture, google_picture, google_email)
                 )
             db.commit()
+            with db.cursor() as cur:
+                cur.execute("SELECT * FROM users WHERE email = %s", (google_email,))
+                user = cur.fetchone()
         else:
             rand_pw = hash_password(_sec.token_urlsafe(32))
             with db.cursor() as cur:
                 cur.execute(
                     """INSERT INTO users
-                       (name, email, password, gmail_address, is_verified, plan, created_at, last_login, login_count)
-                       VALUES (%s, %s, %s, %s, 1, 'free', NOW(), NOW(), 1)""",
-                    (google_name, google_email, rand_pw, google_email)
+                       (name, email, password, gmail_address, avatar, is_verified, plan, created_at, last_login, login_count)
+                       VALUES (%s, %s, %s, %s, %s, 1, 'free', NOW(), NOW(), 1)""",
+                    (google_name, google_email, rand_pw, google_email, google_picture or None)
                 )
             db.commit()
             with db.cursor() as cur:
@@ -1062,6 +1072,7 @@ def google_token_login():
             'email':   google_email,
             'role':    user.get('role', 'user'),
             'token':   token,
+            'avatar':  user.get('avatar') or '',
         }), 200
     finally:
         _return_db(db)
