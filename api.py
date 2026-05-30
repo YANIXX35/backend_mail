@@ -1013,6 +1013,8 @@ def google_code_login():
         return jsonify({'error': 'Google OAuth non configuré'}), 500
 
     try:
+        import os as _os
+        _os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
         config = {
             "web": {
                 "client_id": GOOGLE_CLIENT_ID,
