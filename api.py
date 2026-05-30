@@ -210,8 +210,9 @@ if _gcsj and (not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET):
         GOOGLE_CLIENT_SECRET = GOOGLE_CLIENT_SECRET or _web.get('client_secret', '')
     except Exception:
         pass
-OAUTH_REDIRECT_URI = os.getenv('OAUTH_REDIRECT_URI', 'https://backend-mail-1.onrender.com/api/gmail/callback')
-FRONTEND_URL       = os.getenv('FRONTEND_URL', 'https://notifymails.com')
+OAUTH_REDIRECT_URI       = os.getenv('OAUTH_REDIRECT_URI', 'https://backend-mail-1.onrender.com/api/gmail/callback')
+GOOGLE_LOGIN_REDIRECT_URI = os.getenv('GOOGLE_LOGIN_REDIRECT_URI', 'https://backend-mail-1.onrender.com/api/auth/google/callback')
+FRONTEND_URL             = os.getenv('FRONTEND_URL', 'https://notifymails.com')
 GMAIL_SCOPES       = [
     'https://www.googleapis.com/auth/gmail.readonly',
     'https://www.googleapis.com/auth/gmail.send',
@@ -995,6 +996,136 @@ def google_login():
             'role':    user.get('role', 'user'),
             'token':   token,
         }), 200
+    finally:
+        _return_db(db)
+
+
+@app.route('/api/auth/google-login')
+def google_login_redirect_start():
+    """Redirect OAuth2 — identité seulement (openid/email/profile). Mobile-friendly."""
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        return redirect(f"{FRONTEND_URL}?google_error=not_configured")
+    state = jwt.encode(
+        {'mode': 'login', 'iat': int(time.time()), 'exp': int(time.time()) + 600},
+        JWT_SECRET_KEY, algorithm=JWT_ALGORITHM
+    )
+    config = {
+        "web": {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [GOOGLE_LOGIN_REDIRECT_URI],
+        }
+    }
+    flow = Flow.from_client_config(
+        config,
+        scopes=['openid', 'https://www.googleapis.com/auth/userinfo.email',
+                'https://www.googleapis.com/auth/userinfo.profile'],
+        redirect_uri=GOOGLE_LOGIN_REDIRECT_URI
+    )
+    auth_url, _ = flow.authorization_url(access_type='online', state=state)
+    return redirect(auth_url)
+
+
+@app.route('/api/auth/google/callback')
+def google_login_redirect_callback():
+    """Callback redirect Google login — crée/connecte l'utilisateur et redirige avec JWT."""
+    from urllib.parse import quote as _quote
+    import secrets as _sec
+    import os as _os
+
+    error = request.args.get('error')
+    if error:
+        return redirect(f"{FRONTEND_URL}?google_error={error}")
+
+    code  = request.args.get('code')
+    state = request.args.get('state')
+    if not code or not state:
+        return redirect(f"{FRONTEND_URL}?google_error=missing_params")
+
+    try:
+        payload = jwt.decode(state, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        if payload.get('mode') != 'login':
+            raise ValueError('invalid mode')
+    except Exception:
+        return redirect(f"{FRONTEND_URL}?google_error=state_invalid")
+
+    try:
+        _os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
+        config = {
+            "web": {
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": [GOOGLE_LOGIN_REDIRECT_URI],
+            }
+        }
+        flow = Flow.from_client_config(
+            config,
+            scopes=['openid', 'https://www.googleapis.com/auth/userinfo.email',
+                    'https://www.googleapis.com/auth/userinfo.profile'],
+            redirect_uri=GOOGLE_LOGIN_REDIRECT_URI
+        )
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        userinfo_resp = requests.get(
+            'https://www.googleapis.com/oauth2/v3/userinfo',
+            headers={'Authorization': f'Bearer {creds.token}'}, timeout=10
+        )
+        userinfo       = userinfo_resp.json()
+        google_email   = userinfo.get('email', '').lower()
+        google_name    = userinfo.get('name', '') or google_email.split('@')[0]
+        google_picture = userinfo.get('picture', '')
+        if not google_email:
+            return redirect(f"{FRONTEND_URL}?google_error=no_email")
+    except Exception as e:
+        print(f"[Google Login CB] Error: {e}")
+        return redirect(f"{FRONTEND_URL}?google_error=callback_failed")
+
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE email = %s", (google_email,))
+            user = cur.fetchone()
+        if user:
+            with db.cursor() as cur:
+                cur.execute(
+                    """UPDATE users SET last_login=NOW(),
+                        login_count=COALESCE(login_count,0)+1,
+                        avatar=CASE WHEN (avatar IS NULL OR avatar='') AND %s!=''
+                                    THEN %s ELSE avatar END
+                    WHERE email=%s""",
+                    (google_picture, google_picture, google_email)
+                )
+            db.commit()
+            with db.cursor() as cur:
+                cur.execute("SELECT * FROM users WHERE email = %s", (google_email,))
+                user = cur.fetchone()
+        else:
+            rand_pw = hash_password(_sec.token_urlsafe(32))
+            with db.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO users
+                       (name,email,password,gmail_address,avatar,is_verified,plan,created_at,last_login,login_count)
+                       VALUES (%s,%s,%s,%s,%s,1,'free',NOW(),NOW(),1)""",
+                    (google_name, google_email, rand_pw, google_email, google_picture or None)
+                )
+            db.commit()
+            with db.cursor() as cur:
+                cur.execute("SELECT * FROM users WHERE email = %s", (google_email,))
+                user = cur.fetchone()
+
+        token  = generate_token(user['id'], google_email)
+        avatar = user.get('avatar') or ''
+        role   = user.get('role', 'user')
+        print(f"[Google Login CB] OK — {google_email}")
+        return redirect(
+            f"{FRONTEND_URL}?google_token={token}"
+            f"&gname={_quote(user['name'])}&gemail={_quote(google_email)}"
+            f"&grole={role}&gavatar={_quote(avatar)}"
+        )
     finally:
         _return_db(db)
 
