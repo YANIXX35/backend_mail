@@ -1016,6 +1016,7 @@ def logout():
 
 
 @app.route('/api/config')
+@limiter.limit("30 per minute")
 def public_config():
     """Expose les paramètres publics nécessaires au frontend."""
     return jsonify({'google_client_id': GOOGLE_CLIENT_ID or ''}), 200
@@ -2174,6 +2175,7 @@ def gmail_status_legacy():
 
 
 @app.route('/api/status')
+@limiter.limit("20 per minute")
 def get_status():
     return jsonify({
         "running":              notifier_status["running"],
@@ -4594,6 +4596,27 @@ def _startup():
         traceback.print_exc()
 
 _startup()
+
+# ─── HONEYPOT — routes appâts pour détecter les scanners/hackers ──────────────
+_honeypot_hits: dict = {}
+
+def _log_honeypot(path: str):
+    ip = request.remote_addr or 'unknown'
+    ua = request.headers.get('User-Agent', '')[:120]
+    _honeypot_hits[ip] = _honeypot_hits.get(ip, 0) + 1
+    print(f"[HONEYPOT] 🍯 IP={ip} hits={_honeypot_hits[ip]} path={path} ua={ua}")
+
+@app.route('/api/.env')
+@app.route('/api/admin/config')
+@app.route('/api/debug')
+@app.route('/.git/config')
+@app.route('/wp-admin/')
+@app.route('/phpmyadmin/')
+@app.route('/api/v1/users')
+def honeypot():
+    _log_honeypot(request.path)
+    return jsonify({'error': 'Not found'}), 404
+
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
