@@ -17,3 +17,5 @@ PyJWT==2.8.0
 firebase-admin==6.5.0
 sentry-sdk[flask]==2.19.2
 cloudinary==1.41.0
+cryptography==42.0.8
+flask-talisman==1.1.0

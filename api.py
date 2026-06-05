@@ -29,6 +29,30 @@ import psycopg2.pool
 import bcrypt
 import jwt
 import base64
+import secrets
+from cryptography.fernet import Fernet, InvalidToken
+
+# ── CHIFFREMENT DONNÉES SENSIBLES (Fernet symétrique) ─────────────────────────
+_FERNET_KEY = os.getenv('FERNET_KEY', '')
+_fernet: Fernet | None = None
+if _FERNET_KEY:
+    try:
+        _fernet = Fernet(_FERNET_KEY.encode())
+    except Exception:
+        print('[SECURITY] FERNET_KEY invalide — chiffrement désactivé')
+
+def _encrypt(value: str | None) -> str | None:
+    if not value or not _fernet:
+        return value
+    return _fernet.encrypt(value.encode()).decode()
+
+def _decrypt(value: str | None) -> str | None:
+    if not value or not _fernet:
+        return value
+    try:
+        return _fernet.decrypt(value.encode()).decode()
+    except (InvalidToken, Exception):
+        return value  # Donnée ancienne non chiffrée — retourner tel quel
 
 # ── CACHE MÉMOIRE (TTL simple, thread-safe) ────────────────────────────────────
 _cache: dict = {}
@@ -131,6 +155,16 @@ ALLOWED_ORIGINS = [
     "http://localhost:8081",
 ]
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
+
+@app.after_request
+def set_security_headers(response):
+    response.headers['X-Content-Type-Options']  = 'nosniff'
+    response.headers['X-Frame-Options']          = 'DENY'
+    response.headers['X-XSS-Protection']         = '1; mode=block'
+    response.headers['Referrer-Policy']           = 'strict-origin-when-cross-origin'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['Permissions-Policy']        = 'geolocation=(), microphone=(), camera=()'
+    return response
 
 # Initialiser SocketIO pour WebSocket avec les mêmes origines que CORS
 socketio = SocketIO(app, cors_allowed_origins=ALLOWED_ORIGINS, async_mode='threading')
@@ -243,17 +277,30 @@ def token_required(f):
         try:
             # Décoder le token
             payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
-            user_id = payload['user_id']
+            user_id    = payload['user_id']
             user_email = payload['email']
-            
-            # Vérifier que l'utilisateur existe
+            jti        = payload.get('jti')
+
+            # Vérifier que l'utilisateur existe et n'est pas banni/suspendu
             db = get_db()
             with db.cursor() as cur:
-                cur.execute("SELECT id, email FROM users WHERE id = %s AND email = %s", (user_id, user_email))
+                # Vérifier blacklist JWT
+                if jti:
+                    cur.execute("SELECT 1 FROM revoked_tokens WHERE jti = %s", (jti,))
+                    if cur.fetchone():
+                        return jsonify({'error': 'Token révoqué — veuillez vous reconnecter'}), 401
+                cur.execute(
+                    "SELECT id, email, is_suspended, is_banned FROM users WHERE id = %s AND email = %s",
+                    (user_id, user_email)
+                )
                 user = cur.fetchone()
-                
+
             if not user:
                 return jsonify({'error': 'Utilisateur non trouvé'}), 401
+            if user.get('is_banned'):
+                return jsonify({'error': 'Compte banni'}), 403
+            if user.get('is_suspended'):
+                return jsonify({'error': 'Compte suspendu'}), 403
                 
         except jwt.ExpiredSignatureError:
             return jsonify({'error': 'Token expiré'}), 401
@@ -315,12 +362,13 @@ def admin_required(f):
 
 
 def generate_token(user_id: int, email: str) -> str:
-    """Génère un token JWT pour l'utilisateur."""
+    """Génère un token JWT avec jti unique pour permettre la révocation."""
     payload = {
         'user_id': user_id,
-        'email': email,
-        'exp': datetime.utcnow() + timedelta(hours=24),  # Expire dans 24h
-        'iat': datetime.utcnow()
+        'email':   email,
+        'jti':     secrets.token_hex(16),
+        'exp':     datetime.utcnow() + timedelta(hours=24),
+        'iat':     datetime.utcnow()
     }
     return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
@@ -449,6 +497,7 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_connected_email VARCHAR(150)")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN DEFAULT FALSE")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT FALSE")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_chat_id VARCHAR(80)")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_enabled BOOLEAN DEFAULT TRUE")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_enabled BOOLEAN DEFAULT TRUE")
@@ -536,6 +585,16 @@ def init_db():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_wa_conv_wa_msg ON wa_conversations(wa_message_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_wa_conv_user ON wa_conversations(user_email)")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS revoked_tokens (
+                    jti        VARCHAR(64) PRIMARY KEY,
+                    expires_at TIMESTAMP NOT NULL,
+                    revoked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_revoked_exp ON revoked_tokens(expires_at)")
+            # Nettoyer les tokens expirés au démarrage
+            cur.execute("DELETE FROM revoked_tokens WHERE expires_at < NOW()")
         db.commit()
         print("Tables verifiees/creees avec succes.")
     finally:
@@ -900,6 +959,11 @@ def login():
         if not verify_password(password, user['password']):
             return jsonify({'error': 'Email ou mot de passe incorrect'}), 401
 
+        if user.get('is_banned'):
+            return jsonify({'error': 'Votre compte a été banni. Contactez le support.'}), 403
+        if user.get('is_suspended'):
+            return jsonify({'error': 'Votre compte est temporairement suspendu.'}), 403
+
         # Migration transparente : re-hasher les anciens comptes SHA256 vers bcrypt
         if not (user['password'].startswith('$2b$') or user['password'].startswith('$2a$')):
             new_hash = hash_password(password)
@@ -923,6 +987,32 @@ def login():
         }), 200
     finally:
         _return_db(db)
+
+
+@app.route('/api/auth/logout', methods=['POST'])
+@token_required
+def logout():
+    """Révoque le JWT courant — le token ne pourra plus être utilisé même avant expiration."""
+    token = request.headers.get('Authorization', '').replace('Bearer ', '')
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        jti     = payload.get('jti')
+        exp     = datetime.utcfromtimestamp(payload['exp'])
+        if jti:
+            db = get_db()
+            try:
+                with db.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO revoked_tokens (jti, expires_at) VALUES (%s, %s) ON CONFLICT (jti) DO NOTHING",
+                        (jti, exp)
+                    )
+                db.commit()
+            finally:
+                _return_db(db)
+    except Exception:
+        pass
+    return jsonify({'message': 'Déconnexion réussie'}), 200
+
 
 
 @app.route('/api/config')
@@ -1367,9 +1457,18 @@ def admin_user_activity():
 @app.route('/api/admin/users', methods=['GET'])
 @admin_required
 def admin_get_users():
+    try:
+        page  = max(1, int(request.args.get('page', 1)))
+        limit = min(200, max(1, int(request.args.get('limit', 100))))
+    except (ValueError, TypeError):
+        page, limit = 1, 100
+    offset = (page - 1) * limit
+
     db = get_db()
     try:
         with db.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS total FROM users")
+            total = cur.fetchone()['total']
             cur.execute("""
                 SELECT id, name, email, is_verified, role, plan, phone,
                        gmail_address, telegram_chat_id, green_api_instance,
@@ -1377,9 +1476,12 @@ def admin_get_users():
                        CASE WHEN gmail_refresh_token IS NOT NULL THEN TRUE ELSE FALSE END as gmail_oauth_connected,
                        COALESCE(gmail_scope_v2, FALSE) as gmail_scope_v2,
                        CASE WHEN last_history_id IS NOT NULL THEN TRUE ELSE FALSE END as monitor_active,
+                       COALESCE(is_suspended, FALSE) as is_suspended,
+                       COALESCE(is_banned, FALSE) as is_banned,
                        created_at
                 FROM users ORDER BY created_at DESC
-            """)
+                LIMIT %s OFFSET %s
+            """, (limit, offset))
             rows = cur.fetchall()
             users = []
             for u in rows:
@@ -1387,7 +1489,7 @@ def admin_get_users():
                 if u.get('created_at'):
                     u['created_at'] = u['created_at'].strftime('%Y-%m-%d %H:%M')
                 users.append(u)
-        return jsonify(users), 200
+        return jsonify({'users': users, 'total': total, 'page': page, 'pages': -(-total // limit)}), 200
     finally:
         _return_db(db)
 
@@ -1675,6 +1777,24 @@ def admin_suspend_user(user_id):
         _return_db(db)
 
 
+@app.route('/api/admin/users/<int:user_id>/ban', methods=['PATCH'])
+@admin_required
+def admin_ban_user(user_id):
+    data = request.json or {}
+    banned = bool(data.get('is_banned', False))
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("UPDATE users SET is_banned=%s WHERE id=%s", (banned, user_id))
+        db.commit()
+        action = 'banni' if banned else 'debanni'
+        return jsonify({'message': f'Utilisateur {action}'}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        _return_db(db)
+
+
 @app.route('/api/admin/users/<path:email>/emails', methods=['GET'])
 @admin_required
 def admin_get_user_emails(email):
@@ -1821,8 +1941,8 @@ def _get_gmail_service(user_email: str):
     )
 
     creds = Credentials(
-        token=row.get('gmail_access_token'),
-        refresh_token=row['gmail_refresh_token'],
+        token=_decrypt(row.get('gmail_access_token')),
+        refresh_token=_decrypt(row['gmail_refresh_token']),
         token_uri='https://oauth2.googleapis.com/token',
         client_id=GOOGLE_CLIENT_ID,
         client_secret=GOOGLE_CLIENT_SECRET,
@@ -1948,8 +2068,8 @@ def gmail_oauth_callback():
                         gmail_scope_v2   = %s
                     WHERE email = %s AND is_verified = 1""",
                     (
-                        creds.token,
-                        creds.refresh_token,
+                        _encrypt(creds.token),
+                        _encrypt(creds.refresh_token),
                         int(creds.expiry.timestamp()) if creds.expiry else None,
                         gmail_email,
                         gmail_email,
@@ -2146,10 +2266,11 @@ def get_emails():
 
 
 @app.route('/api/email/<message_id>')
+@token_required
 def get_email_detail(message_id):
-    email = request.args.get('email', '').strip().lower()
-    if not email or not message_id:
-        return jsonify({"error": "email et message_id requis"}), 400
+    email = request.current_user['email']
+    if not message_id:
+        return jsonify({"error": "message_id requis"}), 400
     try:
         service = _get_gmail_service(email)
         if not service:
@@ -2264,7 +2385,7 @@ def reply_email():
 @token_required
 def get_templates():
     """Liste les templates personnalisés de l'utilisateur + les templates par défaut."""
-    user_email = request.user_email
+    user_email = request.current_user['email']
     custom = _get_user_templates(user_email)
     defaults = [
         {'id': None, 'name': 'OK, merci !', 'content': WA_REPLY_TEMPLATES['1'], 'is_default': True, 'key': '1'},
@@ -2283,7 +2404,7 @@ def get_templates():
 @token_required
 def create_template():
     """Crée un template personnalisé."""
-    user_email = request.user_email
+    user_email = request.current_user['email']
     body = request.get_json(silent=True) or {}
     name = _str(body.get('name', ''), 100)
     content = _str(body.get('content', ''), 2000)
@@ -2319,7 +2440,7 @@ def create_template():
 @token_required
 def update_template(template_id: int):
     """Met à jour un template personnalisé."""
-    user_email = request.user_email
+    user_email = request.current_user['email']
     body = request.get_json(silent=True) or {}
     name = _str(body.get('name', ''), 100)
     content = _str(body.get('content', ''), 2000)
@@ -2347,7 +2468,7 @@ def update_template(template_id: int):
 @token_required
 def delete_template(template_id: int):
     """Supprime un template personnalisé."""
-    user_email = request.user_email
+    user_email = request.current_user['email']
     db = get_db()
     try:
         with db.cursor() as cur:
@@ -2367,6 +2488,7 @@ def delete_template(template_id: int):
 
 
 @app.route('/api/whatsapp/webhook', methods=['POST'])
+@limiter.limit("200 per minute")
 def whatsapp_webhook():
     """Webhook Green API — commandes + réponse à email via WhatsApp."""
     try:
@@ -2672,6 +2794,7 @@ def get_stats():
 # ─── USER SETTINGS ────────────────────────────────────────────────────────────
 
 @app.route('/api/user/whatsapp-check', methods=['GET'])
+@token_required
 def whatsapp_check_number():
     """Vérifie si un numéro est sur WhatsApp via checkWhatsapp."""
     phone = (request.args.get('phone') or '').strip()
