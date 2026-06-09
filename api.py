@@ -158,49 +158,27 @@ CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credenti
 
 @app.after_request
 def set_security_headers(response):
-    response.headers['X-Content-Type-Options']  = 'nosniff'
-    response.headers['X-Frame-Options']          = 'DENY'
-    response.headers['X-XSS-Protection']         = '1; mode=block'
-    response.headers['Referrer-Policy']           = 'strict-origin-when-cross-origin'
-    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
-    response.headers['Permissions-Policy']        = 'geolocation=(), microphone=(), camera=()'
-    return response
-
-# Initialiser SocketIO pour WebSocket avec les mêmes origines que CORS
-socketio = SocketIO(app, cors_allowed_origins=ALLOWED_ORIGINS, async_mode='threading')
-
-# Rate limiting (mémoire locale — réinitialisé au redémarrage)
-# Désactivé en environnement de test (TESTING=1) pour éviter les conflits avec threading mocks
-limiter = Limiter(
-    get_remote_address,
-    app=app,
-    default_limits=[],
-    storage_uri="memory://",
-    enabled=not bool(os.getenv('TESTING')),
-)
-
-@app.after_request
-def add_security_headers(response):
     origin = request.headers.get('Origin', '')
-    
-    # CORS : Autoriser explicitement l'origin Vercel
+
+    # CORS : uniquement les origines explicitement autorisées — pas de wildcard
     if origin in ALLOWED_ORIGINS:
-        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Access-Control-Allow-Origin']      = origin
         response.headers['Access-Control-Allow-Credentials'] = 'true'
-    else:
-        # Pour le développement, autoriser toutes les origins (à commenter en prod)
-        response.headers['Access-Control-Allow-Origin'] = '*'
-    
-    # Headers CORS complets
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Cache-Control, Pragma, X-Requested-With, Expires'
+    # Origines inconnues : aucun header CORS → le navigateur bloquera la requête
+
+    response.headers['Access-Control-Allow-Headers'] = (
+        'Content-Type, Authorization, Cache-Control, Pragma, X-Requested-With, Expires'
+    )
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS, PATCH'
-    response.headers['Access-Control-Max-Age'] = '86400'  # 24 heures
-    
-    # Headers de sécurité
-    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
-    response.headers['Pragma'] = 'no-cache'
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Access-Control-Max-Age']        = '86400'
+    response.headers['Cache-Control']                 = 'no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma']                        = 'no-cache'
+    response.headers['X-Content-Type-Options']        = 'nosniff'
+    response.headers['X-Frame-Options']               = 'DENY'
+    response.headers['X-XSS-Protection']              = '1; mode=block'
+    response.headers['Referrer-Policy']               = 'strict-origin-when-cross-origin'
+    response.headers['Strict-Transport-Security']     = 'max-age=31536000; includeSubDomains'
+    response.headers['Permissions-Policy']            = 'geolocation=(), microphone=(), camera=()'
     return response
 
 @app.route('/api/<path:path>', methods=['OPTIONS'])
@@ -222,7 +200,24 @@ def handle_options(path):
 SMTP_EMAIL        = os.getenv('SMTP_EMAIL')
 SMTP_PASSWORD     = os.getenv('SMTP_PASSWORD')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-JWT_SECRET_KEY    = os.getenv('JWT_SECRET_KEY', 'your-secret-key-change-in-production')
+JWT_SECRET_KEY    = os.getenv('JWT_SECRET_KEY')
+if not JWT_SECRET_KEY:
+    raise RuntimeError(
+        "[SECURITY] JWT_SECRET_KEY non définie dans les variables d'environnement. "
+        "Générez une clé avec : python -c \"import secrets; print(secrets.token_hex(32))\""
+    )
+
+# ─── GENIUSPAY ────────────────────────────────────────────────────────────────
+GENIUSPAY_BASE_URL      = os.getenv('GENIUSPAY_BASE_URL', 'https://geniuspay.ci/api/v1/merchant')
+GENIUSPAY_API_KEY       = os.getenv('GENIUSPAY_API_KEY', '')
+GENIUSPAY_API_SECRET    = os.getenv('GENIUSPAY_API_SECRET', '')
+GENIUSPAY_WEBHOOK_SECRET = os.getenv('GENIUSPAY_WEBHOOK_SECRET', '')
+
+PLAN_PRICES = {
+    'test':       200,   # plan de test uniquement — minimum GeniusPay
+    'premium':    2000,
+    'enterprise': 5000,
+}
 JWT_ALGORITHM     = 'HS256'
 
 # ─── GREEN-API (WhatsApp) — instance partagée admin ───────────────────────────
@@ -536,9 +531,14 @@ def init_db():
                     plan VARCHAR(20),
                     amount DECIMAL(10,2),
                     status VARCHAR(20) DEFAULT 'paid',
+                    reference VARCHAR(60),
+                    checkout_url TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS reference VARCHAR(60)")
+            cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS checkout_url TEXT")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_ref ON payments(reference)")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS whatsapp_email_map (
                     wa_msg_id VARCHAR(100) PRIMARY KEY,
@@ -880,6 +880,7 @@ def forgot_password():
 
 
 @app.route('/api/auth/reset-password', methods=['POST'])
+@limiter.limit("5 per minute; 10 per hour")
 def reset_password():
     """Réinitialise le mot de passe avec le code OTP."""
     data = request.json
@@ -1603,6 +1604,194 @@ def admin_delete_payment(pay_id):
         return jsonify({'message': 'Paiement supprime'}), 200
     finally:
         _return_db(db)
+
+
+# ─── GENIUSPAY — PAIEMENTS UTILISATEUR ───────────────────────────────────────
+
+@app.route('/api/payments/initiate', methods=['POST'])
+@token_required
+@limiter.limit("10 per minute")
+def payment_initiate():
+    """Crée un paiement GeniusPay et retourne l'URL de checkout."""
+    data  = request.get_json() or {}
+    plan  = _str(data.get('plan', ''), 20).lower()
+    email = _str(data.get('email', ''), 150).lower()
+
+    if plan not in PLAN_PRICES:
+        return jsonify({'error': f'Plan invalide. Valeurs acceptées : {list(PLAN_PRICES.keys())}'}), 400
+    if not _is_valid_email(email):
+        return jsonify({'error': 'Email invalide'}), 400
+    if not GENIUSPAY_API_KEY or not GENIUSPAY_API_SECRET:
+        return jsonify({'error': 'Paiement non configuré côté serveur'}), 503
+
+    amount  = PLAN_PRICES[plan]
+    user_id = request.current_user['id']
+
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT name FROM users WHERE id = %s", (user_id,))
+            u = cur.fetchone()
+        user_name = u['name'] if u else email.split('@')[0]
+    finally:
+        _return_db(db)
+
+    payload = {
+        'amount':      amount,
+        'currency':    'XOF',
+        'description': f'Abonnement NotifyMails {plan.capitalize()} — 1 mois',
+        'customer':    {'name': user_name, 'email': email},
+        'success_url': f'{FRONTEND_URL}?payment_status=success&plan={plan}&email={email}',
+        'error_url':   f'{FRONTEND_URL}?payment_status=error&plan={plan}',
+        'metadata':    {'user_id': str(user_id), 'plan': plan},
+    }
+    headers = {
+        'X-API-Key':    GENIUSPAY_API_KEY,
+        'X-API-Secret': GENIUSPAY_API_SECRET,
+        'Content-Type': 'application/json',
+    }
+
+    try:
+        resp = requests.post(
+            f'{GENIUSPAY_BASE_URL}/payments',
+            json=payload, headers=headers, timeout=15
+        )
+        resp.raise_for_status()
+        gp = resp.json()
+    except requests.exceptions.RequestException as e:
+        print(f'[GeniusPay] Erreur initiate: {e}')
+        return jsonify({'error': 'Erreur de communication avec GeniusPay'}), 502
+
+    if not gp.get('success') or not gp.get('data'):
+        return jsonify({'error': gp.get('message', 'Réponse GeniusPay invalide')}), 502
+
+    reference    = gp['data']['reference']
+    checkout_url = gp['data']['checkout_url']
+
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "INSERT INTO payments (user_id, plan, amount, status, reference, checkout_url) "
+                "VALUES (%s, %s, %s, 'pending', %s, %s)",
+                (user_id, plan, amount, reference, checkout_url)
+            )
+        db.commit()
+    finally:
+        _return_db(db)
+
+    return jsonify({'payment_url': checkout_url, 'tx_id': reference}), 200
+
+
+@app.route('/api/payments/verify', methods=['POST'])
+@token_required
+@limiter.limit("20 per minute")
+def payment_verify():
+    """Vérifie le statut d'un paiement GeniusPay via sa référence."""
+    data      = request.get_json() or {}
+    reference = _str(data.get('tx_id') or data.get('reference', ''), 60)
+    plan      = _str(data.get('plan', ''), 20).lower()
+    email     = _str(data.get('email', ''), 150).lower()
+
+    if not reference:
+        return jsonify({'error': 'Référence manquante'}), 400
+    if not GENIUSPAY_API_KEY or not GENIUSPAY_API_SECRET:
+        return jsonify({'error': 'Paiement non configuré côté serveur'}), 503
+
+    headers = {
+        'X-API-Key':    GENIUSPAY_API_KEY,
+        'X-API-Secret': GENIUSPAY_API_SECRET,
+        'Content-Type': 'application/json',
+    }
+    try:
+        resp = requests.get(
+            f'{GENIUSPAY_BASE_URL}/payments/{reference}',
+            headers=headers, timeout=15
+        )
+        resp.raise_for_status()
+        gp = resp.json()
+    except requests.exceptions.RequestException as e:
+        print(f'[GeniusPay] Erreur verify: {e}')
+        return jsonify({'error': 'Erreur de communication avec GeniusPay'}), 502
+
+    gp_data = gp.get('data', {})
+    status  = gp_data.get('status', '')
+
+    if status == 'completed':
+        user_id = request.current_user['id']
+        db = get_db()
+        try:
+            with db.cursor() as cur:
+                cur.execute("UPDATE users SET plan = %s WHERE id = %s", (plan, user_id))
+                cur.execute(
+                    "UPDATE payments SET status = 'paid' WHERE reference = %s",
+                    (reference,)
+                )
+            db.commit()
+        finally:
+            _return_db(db)
+        return jsonify({'status': 'paid', 'plan': plan}), 200
+
+    return jsonify({'status': status}), 200
+
+
+@app.route('/api/webhooks/geniuspay', methods=['POST'])
+def geniuspay_webhook():
+    """Webhook GeniusPay — active le plan utilisateur dès confirmation du paiement."""
+    import hmac as _hmac
+
+    raw_body  = request.get_data()
+    signature = request.headers.get('X-Webhook-Signature', '')
+    timestamp = request.headers.get('X-Webhook-Timestamp', '')
+
+    # Vérification anti-replay (5 minutes max)
+    try:
+        ts = int(timestamp)
+        if abs(time.time() - ts) > 300:
+            return jsonify({'error': 'Timestamp trop ancien'}), 400
+    except (ValueError, TypeError):
+        return jsonify({'error': 'Timestamp invalide'}), 400
+
+    # Vérification signature HMAC-SHA256
+    if GENIUSPAY_WEBHOOK_SECRET:
+        expected = _hmac.new(
+            GENIUSPAY_WEBHOOK_SECRET.encode(),
+            f'{timestamp}.{raw_body.decode()}'.encode(),
+            'sha256'
+        ).hexdigest()
+        if not _hmac.compare_digest(expected, signature):
+            print('[GeniusPay Webhook] Signature invalide')
+            return jsonify({'error': 'Signature invalide'}), 401
+
+    data  = request.get_json() or {}
+    event = data.get('event', '')
+    gp    = data.get('data', {})
+
+    print(f'[GeniusPay Webhook] event={event} ref={gp.get("reference")}')
+
+    if event == 'payment.success' and gp.get('status') == 'completed':
+        meta      = gp.get('metadata', {})
+        user_id   = meta.get('user_id')
+        plan      = meta.get('plan', 'premium')
+        reference = gp.get('reference', '')
+
+        if not user_id:
+            return jsonify({'error': 'user_id manquant dans metadata'}), 400
+
+        db = get_db()
+        try:
+            with db.cursor() as cur:
+                cur.execute("UPDATE users SET plan = %s WHERE id = %s", (plan, int(user_id)))
+                cur.execute(
+                    "UPDATE payments SET status = 'paid' WHERE reference = %s",
+                    (reference,)
+                )
+            db.commit()
+            print(f'[GeniusPay Webhook] Plan {plan} activé pour user_id={user_id}')
+        finally:
+            _return_db(db)
+
+    return jsonify({'received': True}), 200
 
 
 @app.route('/api/admin/whatsapp-diagnostic', methods=['GET'])
@@ -4190,7 +4379,7 @@ def api_version():
 
 
 @app.route('/api/chatbot', methods=['POST'])
-@limiter.limit("60 per hour; 10 per minute")
+@limiter.limit("20 per hour; 3 per minute")
 def chat_bot():
     """Chatbot IA MailNotifier — gemini-1.5-flash (1500 req/jour) + cache + fallback."""
     data    = request.get_json() or {}
@@ -4201,7 +4390,6 @@ def chat_bot():
         return jsonify({'error': 'message requis'}), 400
 
     GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-    print(f"[Chat] Clé utilisée: ...{GEMINI_API_KEY[-8:] if GEMINI_API_KEY else 'AUCUNE'}")
 
     system_prompt = (
         "Tu es un assistant IA intelligent, sympathique et polyvalent intégré dans MailNotifier.\n\n"
