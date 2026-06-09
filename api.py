@@ -1618,10 +1618,9 @@ def admin_delete_payment(pay_id):
 # ─── GENIUSPAY — PAIEMENTS UTILISATEUR ───────────────────────────────────────
 
 @app.route('/api/payments/initiate', methods=['POST'])
-@token_required
 @limiter.limit("10 per minute")
 def payment_initiate():
-    """Crée un paiement GeniusPay et retourne l'URL de checkout."""
+    """Crée un paiement GeniusPay et retourne l'URL de checkout. Pas de JWT requis."""
     data  = request.get_json() or {}
     plan  = _str(data.get('plan', ''), 20).lower()
     email = _str(data.get('email', ''), 150).lower()
@@ -1633,15 +1632,18 @@ def payment_initiate():
     if not GENIUSPAY_API_KEY or not GENIUSPAY_API_SECRET:
         return jsonify({'error': 'Paiement non configuré côté serveur'}), 503
 
-    amount  = PLAN_PRICES[plan]
-    user_id = request.current_user['id']
+    amount = PLAN_PRICES[plan]
 
+    # Lookup user by email — inscription obligatoire
     db = get_db()
     try:
         with db.cursor() as cur:
-            cur.execute("SELECT name FROM users WHERE id = %s", (user_id,))
+            cur.execute("SELECT id, name FROM users WHERE email = %s", (email,))
             u = cur.fetchone()
-        user_name = u['name'] if u else email.split('@')[0]
+        if not u:
+            return jsonify({'error': 'Aucun compte trouvé avec cet email. Veuillez créer un compte d\'abord.'}), 404
+        user_id   = u['id']
+        user_name = u['name'] or email.split('@')[0]
     finally:
         _return_db(db)
 
@@ -1693,10 +1695,9 @@ def payment_initiate():
 
 
 @app.route('/api/payments/verify', methods=['POST'])
-@token_required
 @limiter.limit("20 per minute")
 def payment_verify():
-    """Vérifie le statut d'un paiement GeniusPay via sa référence."""
+    """Vérifie le statut d'un paiement GeniusPay via sa référence. Pas de JWT requis."""
     data      = request.get_json() or {}
     reference = _str(data.get('tx_id') or data.get('reference', ''), 60)
     plan      = _str(data.get('plan', ''), 20).lower()
@@ -1726,16 +1727,18 @@ def payment_verify():
     gp_data = gp.get('data', {})
     status  = gp_data.get('status', '')
 
-    if status == 'completed':
-        user_id = request.current_user['id']
+    if status == 'completed' and email and plan:
         db = get_db()
         try:
             with db.cursor() as cur:
-                cur.execute("UPDATE users SET plan = %s WHERE id = %s", (plan, user_id))
-                cur.execute(
-                    "UPDATE payments SET status = 'paid' WHERE reference = %s",
-                    (reference,)
-                )
+                cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+                u = cur.fetchone()
+                if u:
+                    cur.execute("UPDATE users SET plan = %s WHERE id = %s", (plan, u['id']))
+                    cur.execute(
+                        "UPDATE payments SET status = 'paid' WHERE reference = %s",
+                        (reference,)
+                    )
             db.commit()
         finally:
             _return_db(db)
