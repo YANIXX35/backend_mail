@@ -143,6 +143,13 @@ def _init_firebase():
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB max request body
 
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://",
+)
+
 # CORS restreint aux origines connues
 ALLOWED_ORIGINS = [
     "https://yanixx35.github.io",
