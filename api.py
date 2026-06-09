@@ -150,6 +150,8 @@ limiter = Limiter(
     storage_uri="memory://",
 )
 
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
 # CORS restreint aux origines connues
 ALLOWED_ORIGINS = [
     "https://yanixx35.github.io",
