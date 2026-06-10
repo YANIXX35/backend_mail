@@ -1667,8 +1667,22 @@ def payment_initiate():
             f'{GENIUSPAY_BASE_URL}/payments',
             json=payload, headers=headers, timeout=15
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            body = {}
+            try: body = resp.json()
+            except Exception: pass
+            msg = body.get('message') or body.get('error') or f'HTTP {resp.status_code}'
+            print(f'[GeniusPay] initiate {resp.status_code}: {resp.text[:400]}')
+            if resp.status_code == 403:
+                msg = 'Clés API GeniusPay invalides ou compte marchand non activé'
+            elif resp.status_code == 401:
+                msg = 'Authentification GeniusPay échouée — vérifier les clés API'
+            return jsonify({'error': msg}), 502
         gp = resp.json()
+    except requests.exceptions.ConnectionError:
+        return jsonify({'error': 'Impossible de joindre GeniusPay (connexion refusée)'}), 502
+    except requests.exceptions.Timeout:
+        return jsonify({'error': 'GeniusPay ne répond pas (délai dépassé)'}), 504
     except requests.exceptions.RequestException as e:
         print(f'[GeniusPay] Erreur initiate: {e}')
         return jsonify({'error': 'Erreur de communication avec GeniusPay'}), 502
@@ -1718,8 +1732,20 @@ def payment_verify():
             f'{GENIUSPAY_BASE_URL}/payments/{reference}',
             headers=headers, timeout=15
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            body = {}
+            try: body = resp.json()
+            except Exception: pass
+            msg = body.get('message') or body.get('error') or f'HTTP {resp.status_code}'
+            print(f'[GeniusPay] verify {resp.status_code}: {resp.text[:400]}')
+            if resp.status_code == 403:
+                msg = 'Clés API GeniusPay invalides ou compte marchand non activé'
+            return jsonify({'error': msg}), 502
         gp = resp.json()
+    except requests.exceptions.ConnectionError:
+        return jsonify({'error': 'Impossible de joindre GeniusPay (connexion refusée)'}), 502
+    except requests.exceptions.Timeout:
+        return jsonify({'error': 'GeniusPay ne répond pas (délai dépassé)'}), 504
     except requests.exceptions.RequestException as e:
         print(f'[GeniusPay] Erreur verify: {e}')
         return jsonify({'error': 'Erreur de communication avec GeniusPay'}), 502
