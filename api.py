@@ -1662,11 +1662,13 @@ def payment_initiate():
         'Content-Type': 'application/json',
     }
 
+    print(f'[GeniusPay] → POST {GENIUSPAY_BASE_URL}/payments | plan={plan} amount={amount} email={email}')
     try:
         resp = requests.post(
             f'{GENIUSPAY_BASE_URL}/payments',
-            json=payload, headers=headers, timeout=15
+            json=payload, headers=headers, timeout=25
         )
+        print(f'[GeniusPay] ← {resp.status_code} ({len(resp.content)} bytes)')
         if not resp.ok:
             body = {}
             try: body = resp.json()
