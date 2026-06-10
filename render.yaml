@@ -3,7 +3,7 @@ services:
     name: mailnotifier-api
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn api:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    startCommand: gunicorn api:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-connections 200 --timeout 120
     envVars:
       - key: DB_HOST
         sync: false
