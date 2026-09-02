@@ -3701,7 +3701,8 @@ def get_user_settings():
                 "green_api_token, app_password, avatar, theme_color, font_family, theme_mode, theme_secondary, "
                 "to_char(theme_updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS theme_updated_at, "
                 "COALESCE(telegram_enabled, TRUE) AS telegram_enabled, "
-                "COALESCE(whatsapp_enabled, TRUE) AS whatsapp_enabled "
+                "COALESCE(whatsapp_enabled, TRUE) AS whatsapp_enabled, "
+                "whatsapp_chat_id "
                 "FROM users WHERE email = %s AND is_verified = 1",
                 (email,)
             )
@@ -3719,7 +3720,7 @@ def get_user_settings():
         user = dict(user)
         for key in ["phone", "gmail_address", "telegram_chat_id", "green_api_instance",
                     "green_api_token", "avatar", "theme_color", "font_family",
-                    "theme_mode", "theme_secondary"]:
+                    "theme_mode", "theme_secondary", "whatsapp_chat_id"]:
             if user.get(key) is None:
                 user[key] = ""
         user['telegram_enabled'] = bool(user.get('telegram_enabled', True))
@@ -3791,7 +3792,8 @@ def update_user_settings():
                         theme_secondary  = COALESCE(%s, theme_secondary),
                         theme_updated_at = CASE WHEN %s THEN NOW() ELSE theme_updated_at END,
                         telegram_enabled = COALESCE(%s, telegram_enabled),
-                        whatsapp_enabled = COALESCE(%s, whatsapp_enabled)
+                        whatsapp_enabled = COALESCE(%s, whatsapp_enabled),
+                        whatsapp_chat_id = COALESCE(%s, whatsapp_chat_id)
                     WHERE email = %s AND is_verified = 1""",
                     (name, _val('phone'), _val('gmail_address'),
                      _val('telegram_chat_id'), _val('green_api_instance'),
@@ -3799,6 +3801,7 @@ def update_user_settings():
                      avatar, theme_color, font_family, theme_mode, theme_secondary,
                      bool(theme_color or font_family or theme_mode or theme_secondary),
                      _bool_val('telegram_enabled'), _bool_val('whatsapp_enabled'),
+                     _val('whatsapp_chat_id'),
                      email)
                 )
             else:
@@ -3817,7 +3820,8 @@ def update_user_settings():
                         theme_secondary  = COALESCE(%s, theme_secondary),
                         theme_updated_at = CASE WHEN %s THEN NOW() ELSE theme_updated_at END,
                         telegram_enabled = COALESCE(%s, telegram_enabled),
-                        whatsapp_enabled = COALESCE(%s, whatsapp_enabled)
+                        whatsapp_enabled = COALESCE(%s, whatsapp_enabled),
+                        whatsapp_chat_id = COALESCE(%s, whatsapp_chat_id)
                     WHERE email = %s AND is_verified = 1""",
                     (name, _val('phone'), _val('gmail_address'),
                      _val('telegram_chat_id'), _val('green_api_instance'),
@@ -3825,6 +3829,7 @@ def update_user_settings():
                      avatar, theme_color, font_family, theme_mode, theme_secondary,
                      bool(theme_color or font_family or theme_mode or theme_secondary),
                      _bool_val('telegram_enabled'), _bool_val('whatsapp_enabled'),
+                     _val('whatsapp_chat_id'),
                      email)
                 )
         db.commit()
