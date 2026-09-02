@@ -248,8 +248,8 @@ if _gcsj and (not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET):
         GOOGLE_CLIENT_SECRET = GOOGLE_CLIENT_SECRET or _web.get('client_secret', '')
     except Exception:
         pass
-OAUTH_REDIRECT_URI       = os.getenv('OAUTH_REDIRECT_URI', 'https://backend-mail-1.onrender.com/api/gmail/callback')
-GOOGLE_LOGIN_REDIRECT_URI = os.getenv('GOOGLE_LOGIN_REDIRECT_URI', 'https://backend-mail-1.onrender.com/api/auth/google/callback')
+OAUTH_REDIRECT_URI       = os.getenv('OAUTH_REDIRECT_URI', 'https://api.notifymails.com/api/gmail/callback')
+GOOGLE_LOGIN_REDIRECT_URI = os.getenv('GOOGLE_LOGIN_REDIRECT_URI', 'https://api.notifymails.com/api/auth/google/callback')
 FRONTEND_URL             = os.getenv('FRONTEND_URL', 'https://notifymails.com')
 GMAIL_SCOPES       = [
     'https://www.googleapis.com/auth/gmail.readonly',
@@ -281,6 +281,9 @@ def token_required(f):
         try:
             # Décoder le token
             payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+            # Rejeter les tokens temporaires 2FA (scope='2fa_pending')
+            if payload.get('scope') == '2fa_pending':
+                return jsonify({'error': 'Token 2FA temporaire — veuillez valider votre code'}), 401
             user_id    = payload['user_id']
             user_email = payload['email']
             jti        = payload.get('jti')
@@ -514,6 +517,14 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS login_count INTEGER DEFAULT 0")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS monitor_last_ok TIMESTAMP")
+            # 2FA — deuxième facteur par email OTP
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS two_fa_enabled BOOLEAN DEFAULT FALSE")
+            # Abonnement — expiration et rappels (Phase 3)
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_expires_at TIMESTAMP")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_renew_sent BOOLEAN DEFAULT FALSE")
+            # Heures calmes (Phase 4)
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS quiet_start VARCHAR(5)")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS quiet_end   VARCHAR(5)")
             # Pré-remplir le chatId @lid connu pour kyliyanisse (checkWhatsapp retourne 404 sur ce serveur)
             cur.execute("""
                 UPDATE users SET whatsapp_chat_id='62508954075303@lid'
@@ -594,6 +605,19 @@ def init_db():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_wa_conv_wa_msg ON wa_conversations(wa_message_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_wa_conv_user ON wa_conversations(user_email)")
+            # Règles de tri personnalisées (Phase 2)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS custom_rules (
+                    id SERIAL PRIMARY KEY,
+                    user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    rule_type VARCHAR(20) NOT NULL,
+                    value VARCHAR(300) NOT NULL,
+                    category VARCHAR(20) NOT NULL DEFAULT 'important',
+                    active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_custom_rules_user ON custom_rules(user_id)")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS revoked_tokens (
                     jti        VARCHAR(64) PRIMARY KEY,
@@ -987,6 +1011,34 @@ def login():
                 (email,)
             )
         db.commit()
+
+        # 2FA : si activée, émettre un token temporaire + envoyer OTP
+        if user.get('two_fa_enabled'):
+            temp_payload = {
+                'user_id': user['id'],
+                'email':   email,
+                'jti':     secrets.token_hex(16),
+                'scope':   '2fa_pending',
+                'exp':     datetime.utcnow() + timedelta(minutes=10),
+                'iat':     datetime.utcnow()
+            }
+            temp_token = jwt.encode(temp_payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+            otp_code   = str(random.randint(100000, 999999))
+            expires    = datetime.utcnow() + timedelta(minutes=10)
+            with db.cursor() as cur:
+                cur.execute("DELETE FROM otp_codes WHERE email = %s", (email,))
+                cur.execute(
+                    "INSERT INTO otp_codes (email, code, name, expires_at) VALUES (%s, %s, %s, %s)",
+                    (email, otp_code, user['name'], expires)
+                )
+            db.commit()
+            threading.Thread(
+                target=send_otp_email,
+                args=(email, user['name'], otp_code),
+                daemon=True
+            ).start()
+            return jsonify({'requires_2fa': True, 'temp_token': temp_token}), 200
+
         token = generate_token(user['id'], email)
         return jsonify({
             'message': 'Connexion reussie',
@@ -1023,6 +1075,102 @@ def logout():
         pass
     return jsonify({'message': 'Déconnexion réussie'}), 200
 
+
+@app.route('/api/auth/2fa/validate', methods=['POST'])
+@limiter.limit("5 per minute")
+def validate_2fa():
+    """Valide le code OTP du deuxième facteur et retourne un JWT complet."""
+    data       = request.json or {}
+    temp_token = _str(data.get('temp_token'), 512)
+    code       = _str(data.get('code'), 10)
+
+    if not temp_token or not code:
+        return jsonify({'error': 'temp_token et code requis'}), 400
+
+    try:
+        payload = jwt.decode(temp_token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        return jsonify({'error': 'Session 2FA expirée — veuillez vous reconnecter'}), 401
+    except jwt.InvalidTokenError:
+        return jsonify({'error': 'Token invalide'}), 401
+
+    if payload.get('scope') != '2fa_pending':
+        return jsonify({'error': 'Token invalide'}), 401
+
+    user_id = payload['user_id']
+    email   = payload['email']
+
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM otp_codes WHERE email = %s AND code = %s AND expires_at > NOW()",
+                (email, code)
+            )
+            row = cur.fetchone()
+
+        if not row:
+            return jsonify({'error': 'Code invalide ou expiré'}), 401
+
+        with db.cursor() as cur:
+            cur.execute("DELETE FROM otp_codes WHERE email = %s", (email,))
+            cur.execute("SELECT id, name, role FROM users WHERE id = %s", (user_id,))
+            user = cur.fetchone()
+        db.commit()
+
+        if not user:
+            return jsonify({'error': 'Utilisateur non trouvé'}), 401
+
+        token = generate_token(user_id, email)
+        return jsonify({
+            'message': 'Connexion réussie',
+            'name':    user['name'],
+            'email':   email,
+            'role':    user.get('role', 'user'),
+            'token':   token,
+        }), 200
+    finally:
+        _return_db(db)
+
+
+@app.route('/api/auth/2fa/toggle', methods=['POST'])
+@token_required
+@limiter.limit("5 per minute")
+def toggle_2fa():
+    """Active ou désactive la 2FA pour l'utilisateur connecté (confirmation mot de passe requise)."""
+    user_id = request.current_user['id']
+
+    data     = request.json or {}
+    password = data.get('password')
+    enabled  = data.get('enabled')
+
+    if password is None or enabled is None:
+        return jsonify({'error': 'password et enabled requis'}), 400
+    if not isinstance(password, str) or len(password) > 128:
+        return jsonify({'error': 'Mot de passe invalide'}), 400
+
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT password FROM users WHERE id = %s", (user_id,))
+            user = cur.fetchone()
+
+        if not user:
+            return jsonify({'error': 'Utilisateur non trouvé'}), 404
+
+        if not verify_password(password, user['password']):
+            return jsonify({'error': 'Mot de passe incorrect'}), 401
+
+        with db.cursor() as cur:
+            cur.execute("UPDATE users SET two_fa_enabled = %s WHERE id = %s", (bool(enabled), user_id))
+        db.commit()
+
+        return jsonify({
+            'message':        '2FA activée' if enabled else '2FA désactivée',
+            'two_fa_enabled': bool(enabled)
+        }), 200
+    finally:
+        _return_db(db)
 
 
 @app.route('/api/config')
@@ -1762,7 +1910,11 @@ def payment_verify():
                 cur.execute("SELECT id FROM users WHERE email = %s", (email,))
                 u = cur.fetchone()
                 if u:
-                    cur.execute("UPDATE users SET plan = %s WHERE id = %s", (plan, u['id']))
+                    cur.execute(
+                        "UPDATE users SET plan=%s, plan_expires_at=NOW() + INTERVAL '30 days', "
+                        "plan_renew_sent=FALSE WHERE id=%s",
+                        (plan, u['id'])
+                    )
                     cur.execute(
                         "UPDATE payments SET status = 'paid' WHERE reference = %s",
                         (reference,)
@@ -1821,13 +1973,17 @@ def geniuspay_webhook():
         db = get_db()
         try:
             with db.cursor() as cur:
-                cur.execute("UPDATE users SET plan = %s WHERE id = %s", (plan, int(user_id)))
+                cur.execute(
+                    "UPDATE users SET plan=%s, plan_expires_at=NOW() + INTERVAL '30 days', "
+                    "plan_renew_sent=FALSE WHERE id=%s",
+                    (plan, int(user_id))
+                )
                 cur.execute(
                     "UPDATE payments SET status = 'paid' WHERE reference = %s",
                     (reference,)
                 )
             db.commit()
-            print(f'[GeniusPay Webhook] Plan {plan} activé pour user_id={user_id}')
+            print(f'[GeniusPay Webhook] Plan {plan} activé pour user_id={user_id}, expire dans 30j')
         finally:
             _return_db(db)
 
@@ -2443,6 +2599,8 @@ def get_emails():
         if not service:
             return jsonify(EMPTY)
 
+        user_rules = _load_user_rules(request.current_user['id'])
+
         # Paramètre de pagination Gmail (pageToken pour pages > 1)
         kwargs: dict = {'userId': 'me', 'maxResults': limit, 'labelIds': ['INBOX']}
         if page > 1:
@@ -2480,7 +2638,7 @@ def get_emails():
                     "date":     hdrs.get('Date', ''),
                     "snippet":  snippet,
                     "unread":   'UNREAD' in msg.get('labelIds', []),
-                    "category": _classify_email(sender, subject, snippet),
+                    "category": _classify_email(sender, subject, snippet, user_rules),
                 })
             except HttpError:
                 continue
@@ -2530,6 +2688,7 @@ def get_email_detail(message_id):
         subject = hdrs.get('Subject', '(Sans objet)')
         sender  = hdrs.get('From', 'Inconnu')
         snippet = msg.get('snippet', '')
+        user_rules = _load_user_rules(request.current_user['id'])
 
         return jsonify({
             "id":        message_id,
@@ -2541,7 +2700,7 @@ def get_email_detail(message_id):
             "body":      body,
             "body_type": mime_type,
             "unread":    'UNREAD' in msg.get('labelIds', []),
-            "category":  _classify_email(sender, subject, snippet),
+            "category":  _classify_email(sender, subject, snippet, user_rules),
         })
     except Exception as e:
         print(f"[ERROR] get_email_detail: {e}")
@@ -2716,6 +2875,298 @@ def delete_template(template_id: int):
         return jsonify({'error': 'Erreur suppression'}), 500
     finally:
         _return_db(db)
+
+
+# ─── RÈGLES DE TRI PERSONNALISÉES (Phase 2) ───────────────────────────────────
+
+_VALID_RULE_TYPES = {'vip', 'sender', 'keyword'}
+_VALID_CATEGORIES = {'important', 'newsletter', 'normal'}
+
+def _invalidate_rules_cache(user_id: int):
+    _cache_set(f"rules:{user_id}", None, ttl=1)
+
+
+@app.route('/api/rules', methods=['GET'])
+@token_required
+@limiter.limit("30 per minute")
+def get_rules():
+    user_id = request.current_user['id']
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT id, rule_type, value, category, active, created_at "
+                "FROM custom_rules WHERE user_id=%s ORDER BY id",
+                (user_id,)
+            )
+            rules = [dict(r) for r in cur.fetchall()]
+        return jsonify({'rules': rules}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        _return_db(db)
+
+
+@app.route('/api/rules', methods=['POST'])
+@token_required
+@limiter.limit("20 per minute")
+def create_rule():
+    user_id   = request.current_user['id']
+    data      = request.get_json(silent=True) or {}
+    rule_type = _str(data.get('rule_type', ''), 20).strip().lower()
+    value     = _str(data.get('value', ''), 300).strip().lower()
+    category  = _str(data.get('category', 'important'), 20).strip().lower()
+
+    if rule_type not in _VALID_RULE_TYPES:
+        return jsonify({'error': f'rule_type invalide (vip, sender, keyword)'}), 400
+    if not value:
+        return jsonify({'error': 'value requis'}), 400
+    if category not in _VALID_CATEGORIES:
+        return jsonify({'error': 'category invalide (important, newsletter, normal)'}), 400
+
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS cnt FROM custom_rules WHERE user_id=%s", (user_id,))
+            if (cur.fetchone() or {}).get('cnt', 0) >= 30:
+                return jsonify({'error': 'Limite de 30 règles atteinte'}), 429
+            cur.execute(
+                "INSERT INTO custom_rules (user_id, rule_type, value, category) "
+                "VALUES (%s,%s,%s,%s) RETURNING id, rule_type, value, category, active, created_at",
+                (user_id, rule_type, value, category)
+            )
+            rule = dict(cur.fetchone())
+        db.commit()
+        _invalidate_rules_cache(user_id)
+        return jsonify({'rule': rule}), 201
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        _return_db(db)
+
+
+@app.route('/api/rules/<int:rule_id>', methods=['PUT'])
+@token_required
+@limiter.limit("20 per minute")
+def update_rule(rule_id: int):
+    user_id  = request.current_user['id']
+    data     = request.get_json(silent=True) or {}
+    category = _str(data.get('category', ''), 20).strip().lower()
+    active   = data.get('active')
+
+    if category and category not in _VALID_CATEGORIES:
+        return jsonify({'error': 'category invalide'}), 400
+
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            if category and active is not None:
+                cur.execute(
+                    "UPDATE custom_rules SET category=%s, active=%s WHERE id=%s AND user_id=%s",
+                    (category, bool(active), rule_id, user_id)
+                )
+            elif category:
+                cur.execute(
+                    "UPDATE custom_rules SET category=%s WHERE id=%s AND user_id=%s",
+                    (category, rule_id, user_id)
+                )
+            elif active is not None:
+                cur.execute(
+                    "UPDATE custom_rules SET active=%s WHERE id=%s AND user_id=%s",
+                    (bool(active), rule_id, user_id)
+                )
+            if cur.rowcount == 0:
+                return jsonify({'error': 'Règle introuvable'}), 404
+        db.commit()
+        _invalidate_rules_cache(user_id)
+        return jsonify({'success': True}), 200
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        _return_db(db)
+
+
+@app.route('/api/rules/<int:rule_id>', methods=['DELETE'])
+@token_required
+@limiter.limit("20 per minute")
+def delete_rule(rule_id: int):
+    user_id = request.current_user['id']
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("DELETE FROM custom_rules WHERE id=%s AND user_id=%s", (rule_id, user_id))
+            if cur.rowcount == 0:
+                return jsonify({'error': 'Règle introuvable'}), 404
+        db.commit()
+        _invalidate_rules_cache(user_id)
+        return jsonify({'success': True}), 200
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        _return_db(db)
+
+
+# ─── DÉTECTION PHISHING / SPAM VIA IA (Phase 2) ───────────────────────────────
+
+@app.route('/api/email/security-check', methods=['POST'])
+@token_required
+@limiter.limit("10 per minute")
+def email_security_check():
+    """Analyse un email pour détecter phishing/spam via Gemini."""
+    user_email = request.current_user['email']
+    data       = request.get_json(silent=True) or {}
+    message_id = _str(data.get('message_id', ''), 100).strip()
+
+    if not message_id:
+        return jsonify({'error': 'message_id requis'}), 400
+
+    cache_key = f"seccheck:{user_email}:{message_id}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+
+    try:
+        service = _get_gmail_service(user_email)
+        if not service:
+            return jsonify({'error': 'Gmail non connecté'}), 403
+
+        msg  = service.users().messages().get(
+            userId='me', id=message_id, format='full'
+        ).execute()
+        hdrs = {h['name']: h['value'] for h in msg.get('payload', {}).get('headers', [])}
+
+        def _extract_text(payload, depth=0):
+            if depth > 5:
+                return ''
+            mime = payload.get('mimeType', '')
+            if mime == 'text/plain':
+                data_b64 = payload.get('body', {}).get('data', '')
+                if data_b64:
+                    import base64
+                    return base64.urlsafe_b64decode(data_b64 + '==').decode('utf-8', errors='replace')
+            result = ''
+            for part in payload.get('parts', []):
+                result += _extract_text(part, depth + 1)
+            return result
+
+        subject = hdrs.get('Subject', '(Sans objet)')[:200]
+        sender  = hdrs.get('From', 'Inconnu')[:200]
+        reply_to = hdrs.get('Reply-To', '')[:200]
+        body_text = _extract_text(msg.get('payload', {}))[:1200]
+        snippet   = msg.get('snippet', '')[:300]
+
+        GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+
+        def _static_analysis():
+            indicators = []
+            score = 0
+            text_all = f"{subject} {sender} {reply_to} {snippet} {body_text}".lower()
+
+            phish_keywords = [
+                'cliquez ici immédiatement', 'votre compte sera suspendu', 'confirmer votre mot de passe',
+                'urgence', 'gagnant', 'loterie', 'héritage', 'prince', 'wire transfer',
+                'verify your account', 'your account has been', 'limited time', 'act now',
+                'click here to verify', 'update your billing', 'confirm your identity',
+                'suspended', 'unauthorized access', 'compte bloqué', 'vérifiez votre identité',
+            ]
+            urgency_keywords = ['urgent', 'immédiatement', 'expire dans', 'dernière chance', 'dernières 24h']
+            suspicious_domains = [
+                '.ru', '.tk', '.ml', '.cf', '.gq', 'noreply@', 'support@secure-',
+                'security@', 'verify@', 'account-', '-secure.', '.xyz',
+            ]
+
+            for k in phish_keywords:
+                if k in text_all:
+                    indicators.append(f'Contenu suspect : "{k}"')
+                    score += 20
+
+            for k in urgency_keywords:
+                if k in text_all:
+                    indicators.append(f'Langage d\'urgence : "{k}"')
+                    score += 10
+
+            for d in suspicious_domains:
+                if d in sender.lower() or d in reply_to.lower():
+                    indicators.append(f'Domaine suspect dans expéditeur : "{d}"')
+                    score += 25
+
+            if reply_to and reply_to.lower() != sender.lower():
+                indicators.append('Reply-To différent de l\'expéditeur')
+                score += 15
+
+            score = min(score, 100)
+            risk = 'low' if score < 30 else ('medium' if score < 60 else 'high')
+            verdict = (
+                'Aucun indicateur de phishing détecté.' if risk == 'low' else
+                'Cet email contient des éléments suspects. Restez vigilant.' if risk == 'medium' else
+                'ALERTE : Cet email présente de forts indicateurs de phishing. Ne cliquez aucun lien.'
+            )
+            return {
+                'score': score, 'risk': risk,
+                'indicators': indicators[:8],
+                'verdict': verdict,
+                'method': 'static',
+            }
+
+        if not GEMINI_API_KEY:
+            result = _static_analysis()
+            _cache_set(cache_key, result, ttl=1800)
+            return jsonify(result)
+
+        prompt = f"""Analyse cet email et détecte s'il s'agit de phishing, spam ou arnaque.
+
+Expéditeur: {sender}
+Reply-To: {reply_to or 'identique à expéditeur'}
+Objet: {subject}
+Contenu: {body_text or snippet}
+
+Réponds UNIQUEMENT avec ce JSON (pas d'autres textes) :
+{{
+  "score": <0-100, 0=sain, 100=phishing certain>,
+  "risk": "<low|medium|high>",
+  "indicators": ["<indicateur 1>", "<indicateur 2>"],
+  "verdict": "<1 phrase de conclusion>"
+}}"""
+
+        GEMINI_MODELS = ['gemini-2.5-flash-lite', 'gemini-2.5-flash']
+        body = {
+            'contents': [{'role': 'user', 'parts': [{'text': prompt}]}],
+            'generationConfig': {'maxOutputTokens': 512, 'temperature': 0.1},
+        }
+
+        result = None
+        for model in GEMINI_MODELS:
+            try:
+                url  = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}'
+                resp = requests.post(url, json=body, timeout=20)
+                if not resp.ok:
+                    continue
+                raw  = resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+                # Extraire le JSON de la réponse (Gemini peut ajouter du Markdown)
+                import json as _json_mod
+                start = raw.find('{')
+                end   = raw.rfind('}') + 1
+                if start != -1 and end > start:
+                    parsed = _json_mod.loads(raw[start:end])
+                    parsed['method'] = 'gemini'
+                    result = parsed
+                    break
+            except Exception as e:
+                print(f"[Security] Gemini {model} error: {e}")
+                continue
+
+        if result is None:
+            result = _static_analysis()
+
+        _cache_set(cache_key, result, ttl=1800)
+        return jsonify(result)
+
+    except Exception as e:
+        print(f"[Security] Erreur: {e}")
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/whatsapp/webhook', methods=['POST'])
@@ -3106,6 +3557,129 @@ def upload_avatar():
     except Exception as e:
         print(f"[Cloudinary] Erreur upload pour {email}: {e}")
         return jsonify({'error': 'Erreur lors de l\'upload'}), 500
+
+
+@app.route('/api/user/export', methods=['GET'])
+@token_required
+@limiter.limit("3 per day")
+def export_user_data():
+    """Exporte toutes les données personnelles de l'utilisateur (conformité RGPD)."""
+    user_id    = request.current_user['id']
+    user_email = request.current_user['email']
+
+    db = get_db()
+    try:
+        export = {}
+
+        def _serial(v):
+            return v.isoformat() if hasattr(v, 'isoformat') else v
+
+        def _row(r):
+            return {k: _serial(v) for k, v in r.items()}
+
+        with db.cursor() as cur:
+            cur.execute("""
+                SELECT id, name, email, role, plan, phone, gmail_connected_email,
+                       telegram_chat_id, is_verified, two_fa_enabled,
+                       created_at, last_login, login_count
+                FROM users WHERE id = %s
+            """, (user_id,))
+            row = cur.fetchone()
+            export['profile'] = _row(row) if row else {}
+
+            cur.execute("""
+                SELECT id, plan, amount, status, reference, created_at
+                FROM payments WHERE user_id = %s ORDER BY created_at DESC
+            """, (user_id,))
+            export['payments'] = [_row(r) for r in cur.fetchall()]
+
+            cur.execute(
+                "SELECT name, content, created_at FROM wa_templates WHERE user_email = %s",
+                (user_email,)
+            )
+            export['wa_templates'] = [_row(r) for r in cur.fetchall()]
+
+            cur.execute(
+                "SELECT preference_key, preference_value, updated_at FROM user_preferences WHERE user_id = %s",
+                (user_id,)
+            )
+            export['preferences'] = [_row(r) for r in cur.fetchall()]
+
+            cur.execute(
+                "SELECT last_sender, last_subject, last_snippet, updated_at FROM wa_context WHERE user_email = %s",
+                (user_email,)
+            )
+            row = cur.fetchone()
+            export['email_context'] = _row(row) if row else {}
+
+        import json as _json
+        response = app.response_class(
+            response=_json.dumps(export, ensure_ascii=False, indent=2, default=str),
+            status=200,
+            mimetype='application/json'
+        )
+        response.headers['Content-Disposition'] = (
+            f'attachment; filename="mailnotifier-data-{user_id}.json"'
+        )
+        return response
+    finally:
+        _return_db(db)
+
+
+@app.route('/api/user/account', methods=['DELETE'])
+@token_required
+@limiter.limit("1 per hour")
+def delete_account():
+    """Supprime définitivement le compte et toutes les données associées (RGPD)."""
+    user_id    = request.current_user['id']
+    user_email = request.current_user['email']
+
+    data     = request.json or {}
+    password = data.get('password')
+
+    if not password or not isinstance(password, str):
+        return jsonify({'error': 'Mot de passe requis pour confirmer la suppression'}), 400
+
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT password, gmail_refresh_token FROM users WHERE id = %s", (user_id,))
+            user = cur.fetchone()
+
+        if not user:
+            return jsonify({'error': 'Utilisateur non trouvé'}), 404
+
+        if not verify_password(password, user['password']):
+            return jsonify({'error': 'Mot de passe incorrect'}), 401
+
+        # Révoquer les tokens OAuth Gmail
+        raw_refresh = user.get('gmail_refresh_token')
+        if raw_refresh:
+            try:
+                refresh_token = _decrypt(raw_refresh)
+                if refresh_token:
+                    requests.post(
+                        'https://oauth2.googleapis.com/revoke',
+                        params={'token': refresh_token}, timeout=5
+                    )
+            except Exception:
+                pass
+
+        # Suppression en cascade de toutes les données utilisateur
+        with db.cursor() as cur:
+            cur.execute("DELETE FROM wa_templates     WHERE user_email = %s", (user_email,))
+            cur.execute("DELETE FROM wa_context        WHERE user_email = %s", (user_email,))
+            cur.execute("DELETE FROM wa_conversations  WHERE user_email = %s", (user_email,))
+            cur.execute("DELETE FROM whatsapp_email_map WHERE user_email = %s", (user_email,))
+            cur.execute("DELETE FROM user_preferences  WHERE user_id    = %s", (user_id,))
+            cur.execute("DELETE FROM otp_codes         WHERE email      = %s", (user_email,))
+            cur.execute("DELETE FROM payments          WHERE user_id    = %s", (user_id,))
+            cur.execute("DELETE FROM users             WHERE id         = %s", (user_id,))
+        db.commit()
+
+        return jsonify({'message': 'Compte supprimé définitivement'}), 200
+    finally:
+        _return_db(db)
 
 
 @app.route('/api/user/settings', methods=['GET'])
@@ -3624,22 +4198,59 @@ _NEWSLETTER_DOMAINS = [
     'mailjet', 'sendinblue', 'brevo', 'campaignmonitor', 'aweber',
 ]
 
-def _classify_email(sender: str, subject: str, snippet: str) -> str:
+def _classify_email(sender: str, subject: str, snippet: str, rules: list | None = None) -> str:
     sender_l  = sender.lower()
     subject_l = subject.lower()
     text      = f"{sender_l} {subject_l} {snippet.lower()}"
 
-    # Newsletter: sender domain or keywords
+    # Custom rules take priority over built-in classification
+    if rules:
+        for rule in rules:
+            if not rule.get('active', True):
+                continue
+            val  = rule['value'].lower()
+            rtype = rule['rule_type']
+            cat   = rule['category']
+            if rtype == 'vip' and val in sender_l:
+                return cat
+            elif rtype == 'sender' and val in sender_l:
+                return cat
+            elif rtype == 'keyword' and val in text:
+                return cat
+
+    # Built-in classification
     if any(d in sender_l for d in _NEWSLETTER_DOMAINS):
         return 'newsletter'
     if any(k in text for k in _NEWSLETTER_KEYWORDS):
         return 'newsletter'
-    # Important: keywords in subject (higher weight) or text
     if any(k in subject_l for k in _IMPORTANT_KEYWORDS):
         return 'important'
     if any(k in text for k in _IMPORTANT_KEYWORDS):
         return 'important'
     return 'normal'
+
+
+def _load_user_rules(user_id: int) -> list:
+    """Charge les règles actives d'un utilisateur depuis la DB (cache 2 min)."""
+    cache_key = f"rules:{user_id}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT id, rule_type, value, category, active FROM custom_rules "
+                "WHERE user_id = %s AND active = TRUE ORDER BY id",
+                (user_id,)
+            )
+            rules = [dict(r) for r in cur.fetchall()]
+        _cache_set(cache_key, rules, ttl=120)
+        return rules
+    except Exception:
+        return []
+    finally:
+        _return_db(db)
 
 
 @app.route('/api/fcm/register', methods=['POST'])
@@ -3833,6 +4444,7 @@ def _check_user_emails_gmail(user):
                     if 'INBOX' in msg.get('labelIds', []):
                         new_ids.append(msg['id'])
 
+            user_rules = _load_user_rules(user_id)
             for msg_id in new_ids:
                 try:
                     msg = service.users().messages().get(
@@ -3844,7 +4456,7 @@ def _check_user_emails_gmail(user):
                     subject  = hdrs.get('Subject', '(Sans objet)')
                     sender   = hdrs.get('From', 'Inconnu')
                     snippet  = msg.get('snippet', '')[:200]
-                    category = _classify_email(sender, subject, snippet)
+                    category = _classify_email(sender, subject, snippet, user_rules)
                     print(f"[Monitor] Email [{category}] : {subject[:60]}")
 
                     if chat_id and user.get('telegram_enabled', True):
@@ -4441,7 +5053,7 @@ def chat_bot():
         "- Notifications Telegram (gratuit) et WhatsApp (premium)\n"
         "- Réponse aux mails depuis WhatsApp : glisser la notification et écrire\n"
         "- Commandes WhatsApp : !aide, !templates, !statut, !dernier, !smart\n"
-        "- Gratuit : Gmail + Telegram | Premium 5 000 XOF/mois : + WhatsApp | Enterprise 15 000 XOF/mois\n\n"
+        "- Gratuit : Gmail + Telegram | Premium 2 000 XOF/mois : + WhatsApp | Enterprise 5 000 XOF/mois\n\n"
         "STYLE : Réponds en français, naturel et chaleureux. "
         "1-2 emojis max. Sois direct. Ne refuse JAMAIS une question."
     )
@@ -4476,7 +5088,7 @@ def chat_bot():
     def _keyword_fallback(msg):
         m = msg.lower()
         if any(w in m for w in ['tarif', 'prix', 'cout', 'combien', 'payer', 'abonnement']):
-            return "💰 Tarifs MailNotifier :\n• Gratuit : Gmail + Telegram\n• Premium (5 000 XOF/mois) : + WhatsApp\n• Enterprise (15 000 XOF/mois) : + Support prioritaire"
+            return "💰 Tarifs MailNotifier :\n• Gratuit : Gmail + Telegram\n• Premium (2 000 XOF/mois) : + WhatsApp\n• Enterprise (5 000 XOF/mois) : + Support prioritaire"
         if any(w in m for w in ['whatsapp', 'wha']):
             return "📱 Pour WhatsApp : Paramètres → WhatsApp, entre ton numéro, vérifie-le, copie l'URL webhook dans Green API. Plan Premium requis."
         if any(w in m for w in ['telegram', 'tele']):
@@ -4766,6 +5378,154 @@ def _send_weekly_summaries():
             _return_db(db)
 
 
+# ─── ABONNEMENT — EXPIRATION & RAPPELS (Phase 3) ─────────────────────────────
+
+@app.route('/api/user/subscription', methods=['GET'])
+@token_required
+def get_subscription():
+    """Retourne le plan actuel, la date d'expiration et le nombre de jours restants."""
+    user_id = request.current_user['id']
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT plan, plan_expires_at FROM users WHERE id=%s",
+                (user_id,)
+            )
+            row = cur.fetchone()
+        if not row:
+            return jsonify({'error': 'Utilisateur introuvable'}), 404
+
+        plan       = row['plan'] or 'free'
+        expires_at = row['plan_expires_at']
+        days_left  = None
+        if expires_at:
+            delta = (expires_at - datetime.utcnow()).days
+            days_left = max(0, delta)
+
+        return jsonify({
+            'plan':       plan,
+            'expires_at': expires_at.isoformat() if expires_at else None,
+            'days_left':  days_left,
+            'is_active':  (days_left is None or days_left > 0) and plan != 'free',
+        }), 200
+    finally:
+        _return_db(db)
+
+
+def _send_renewal_reminder_email(user: dict, days_left: int):
+    """Envoie un email de rappel de renouvellement d'abonnement."""
+    to_email = user['email']
+    name     = (user.get('name') or to_email.split('@')[0]).split()[0]
+    plan     = (user.get('plan') or 'premium').capitalize()
+    try:
+        msg            = MIMEMultipart('alternative')
+        msg['Subject'] = f'Votre abonnement MailNotifier expire dans {days_left} jour{"s" if days_left > 1 else ""}'
+        msg['From']    = f'MailNotifier <{SMTP_EMAIL}>'
+        msg['To']      = to_email
+
+        urgency_color  = '#f59e0b' if days_left > 1 else '#ef4444'
+        renew_url      = os.getenv('FRONTEND_URL', 'https://notifymails.com')
+
+        html = f"""
+        <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:32px;background:#f5f5f5;border-radius:16px;">
+          <div style="text-align:center;margin-bottom:24px;">
+            <h1 style="color:#1a237e;margin:0;">MailNotifier</h1>
+            <p style="color:#666;margin:4px 0;">Rappel d'abonnement</p>
+          </div>
+          <div style="background:white;border-radius:12px;padding:32px;">
+            <p style="color:#333;font-size:16px;">Bonjour <strong>{name}</strong>,</p>
+            <p style="color:#555;font-size:14px;line-height:1.6;">
+              Votre abonnement <strong>MailNotifier {plan}</strong> expire dans
+              <span style="color:{urgency_color};font-weight:700;">{days_left} jour{"s" if days_left > 1 else ""}</span>.
+            </p>
+            <p style="color:#555;font-size:14px;">Sans renouvellement, votre compte passera automatiquement en plan <strong>Gratuit</strong> et les notifications WhatsApp seront désactivées.</p>
+            <div style="text-align:center;margin:28px 0;">
+              <a href="{renew_url}" style="background:#1a237e;color:white;padding:14px 32px;border-radius:10px;text-decoration:none;font-size:15px;font-weight:700;">
+                Renouveler mon abonnement
+              </a>
+            </div>
+            <p style="color:#bbb;font-size:12px;text-align:center;">Si vous ne souhaitez pas renouveler, aucune action n'est requise.</p>
+          </div>
+        </div>
+        """
+        msg.attach(MIMEText(html, 'html'))
+        ctx = create_default_context()
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=ctx) as server:
+            server.login(SMTP_EMAIL, SMTP_PASSWORD)
+            server.sendmail(SMTP_EMAIL, to_email, msg.as_string())
+        print(f"[Renewal] Email rappel envoyé à {to_email} (J-{days_left})")
+    except Exception as e:
+        print(f"[Renewal] Erreur envoi email à {to_email}: {e}")
+
+
+def _check_plan_expirations():
+    """Vérifie les abonnements : rappel J-3 et rétrogradation à l'expiration."""
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            # Rappel J-3 : plan actif, expiration dans 1-3 jours, rappel pas encore envoyé
+            cur.execute("""
+                SELECT id, email, name, plan FROM users
+                WHERE plan != 'free'
+                  AND plan_expires_at IS NOT NULL
+                  AND plan_expires_at > NOW()
+                  AND plan_expires_at <= NOW() + INTERVAL '3 days'
+                  AND plan_renew_sent = FALSE
+            """)
+            to_remind = cur.fetchall()
+
+            for user in to_remind:
+                days_left = max(1, (user['plan_expires_at'] if isinstance(user, dict) else 1))
+                # Recalcul propre
+                cur.execute("SELECT plan_expires_at FROM users WHERE id=%s", (user['id'],))
+                row = cur.fetchone()
+                if row and row['plan_expires_at']:
+                    days_left = max(0, (row['plan_expires_at'] - datetime.utcnow()).days)
+                threading.Thread(
+                    target=_send_renewal_reminder_email,
+                    args=(dict(user), days_left),
+                    daemon=True
+                ).start()
+                cur.execute(
+                    "UPDATE users SET plan_renew_sent=TRUE WHERE id=%s",
+                    (user['id'],)
+                )
+
+            # Rétrogradation : plan expiré depuis plus d'une heure
+            cur.execute("""
+                UPDATE users
+                SET plan='free', plan_renew_sent=FALSE
+                WHERE plan != 'free'
+                  AND plan_expires_at IS NOT NULL
+                  AND plan_expires_at < NOW() - INTERVAL '1 hour'
+                RETURNING id, email, plan
+            """)
+            downgraded = cur.fetchall()
+            for u in downgraded:
+                print(f"[Renewal] Compte {u['email']} rétrogradé vers free (plan expiré)")
+
+        db.commit()
+        if to_remind or downgraded:
+            print(f"[Renewal] {len(to_remind)} rappels envoyés, {len(downgraded)} comptes rétrogradés")
+    except Exception as e:
+        print(f"[Renewal] Erreur check expirations: {e}")
+        db.rollback()
+    finally:
+        _return_db(db)
+
+
+def _plan_expiry_loop():
+    """Vérifie les expirations de plan toutes les heures."""
+    time.sleep(300)   # attendre 5 min après le boot
+    while True:
+        try:
+            _check_plan_expirations()
+        except Exception as e:
+            print(f"[EXPIRY LOOP] Erreur: {e}")
+        time.sleep(3600)   # toutes les heures
+
+
 def _weekly_summary_loop():
     """Vérifie chaque heure si c'est lundi 8h UTC pour envoyer les résumés."""
     time.sleep(180)   # laisse le serveur finir son boot
@@ -4817,6 +5577,8 @@ def _startup():
         threading.Thread(target=_self_ping_loop, daemon=True, name="self-ping").start()
         print("[STARTUP] Lancement thread résumé hebdomadaire...")
         threading.Thread(target=_weekly_summary_loop, daemon=True, name="weekly-summary").start()
+        print("[STARTUP] Lancement thread vérification expirations abonnements...")
+        threading.Thread(target=_plan_expiry_loop, daemon=True, name="plan-expiry").start()
         print("[STARTUP] Tous les threads lances avec succes.")
     except Exception as e:
         import traceback
