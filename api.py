@@ -2417,6 +2417,7 @@ def gmail_oauth_callback():
 
     try:
         # Échanger le code contre des tokens (sans vérif CSRF — le JWT fait office de preuve)
+        os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
         flow = Flow.from_client_config(
             _build_oauth_client_config(),
             scopes=GMAIL_SCOPES,
