@@ -167,7 +167,6 @@ ALLOWED_ORIGINS = [
     "http://localhost:8080",
     "http://localhost:8081",
 ]
-
 @app.after_request
 def set_security_headers(response):
     origin = request.headers.get('Origin', '')
@@ -225,14 +224,10 @@ if not JWT_SECRET_KEY:
         "Générez une clé avec : python -c \"import secrets; print(secrets.token_hex(32))\""
     )
 
-# ─── GENIUSPAY ────────────────────────────────────────────────────────────────
-GENIUSPAY_BASE_URL      = os.getenv('GENIUSPAY_BASE_URL', 'https://geniuspay.ci/api/v1/merchant')
-GENIUSPAY_API_KEY       = os.getenv('GENIUSPAY_API_KEY', '')
-GENIUSPAY_API_SECRET    = os.getenv('GENIUSPAY_API_SECRET', '')
-GENIUSPAY_WEBHOOK_SECRET = os.getenv('GENIUSPAY_WEBHOOK_SECRET', '')
+# ─── WAVE ─────────────────────────────────────────────────────────────────────
+WAVE_MERCHANT_URL = "https://pay.wave.com/m/M_ci_Sw4b5LtKUtt1/c/ci/"
 
 PLAN_PRICES = {
-    'test':       200,   # plan de test uniquement — minimum GeniusPay
     'premium':    2000,
     'enterprise': 5000,
 }
@@ -572,6 +567,9 @@ def init_db():
             """)
             cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS reference VARCHAR(60)")
             cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS checkout_url TEXT")
+            cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS phone VARCHAR(30)")
+            cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS payment_method VARCHAR(20) DEFAULT 'wave'")
+            cur.execute("ALTER TABLE payments ALTER COLUMN user_id DROP NOT NULL")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_ref ON payments(reference)")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS whatsapp_email_map (
@@ -1742,8 +1740,12 @@ def admin_get_payments():
     try:
         with db.cursor() as cur:
             cur.execute("""
-                SELECT p.id, u.name, u.email, p.plan, p.amount, p.status, p.created_at
-                FROM payments p JOIN users u ON p.user_id=u.id
+                SELECT p.id, COALESCE(u.name, p.phone, 'Anonyme') AS name,
+                       COALESCE(u.email, '') AS email,
+                       p.plan, p.amount, p.status, p.created_at,
+                       COALESCE(p.phone, '') AS phone,
+                       COALESCE(p.payment_method, 'wave') AS payment_method
+                FROM payments p LEFT JOIN users u ON p.user_id = u.id
                 ORDER BY p.created_at DESC
             """)
             rows = cur.fetchall()
@@ -1781,6 +1783,33 @@ def admin_create_payment():
         _return_db(db)
 
 
+@app.route('/api/admin/payments/<int:pay_id>/confirm', methods=['POST'])
+@admin_required
+def admin_confirm_payment(pay_id):
+    """Confirme un paiement Wave : le marque comme payé et active le plan."""
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT * FROM payments WHERE id = %s", (pay_id,))
+            p = cur.fetchone()
+            if not p:
+                return jsonify({'error': 'Paiement introuvable'}), 404
+            p = dict(p)
+            cur.execute("UPDATE payments SET status='paid' WHERE id=%s", (pay_id,))
+            if p.get('user_id') and p.get('plan'):
+                cur.execute(
+                    "UPDATE users SET plan=%s, plan_expires_at=NOW() + INTERVAL '30 days', "
+                    "plan_renew_sent=FALSE WHERE id=%s",
+                    (p['plan'], p['user_id'])
+                )
+        db.commit()
+        return jsonify({'message': 'Paiement confirmé'}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        _return_db(db)
+
+
 @app.route('/api/admin/payments/<int:pay_id>', methods=['DELETE'])
 @admin_required
 def admin_delete_payment(pay_id):
@@ -1794,231 +1823,39 @@ def admin_delete_payment(pay_id):
         _return_db(db)
 
 
-# ─── GENIUSPAY — PAIEMENTS UTILISATEUR ───────────────────────────────────────
+# ─── WAVE — PAIEMENTS UTILISATEUR ────────────────────────────────────────────
 
-@app.route('/api/payments/initiate', methods=['POST'])
+@app.route('/api/payments/wave', methods=['POST'])
 @limiter.limit("10 per minute")
-def payment_initiate():
-    """Crée un paiement GeniusPay et retourne l'URL de checkout. Pas de JWT requis."""
+def payment_wave():
+    """Crée un paiement Wave et retourne l'URL de paiement Wave."""
     data  = request.get_json() or {}
     plan  = _str(data.get('plan', ''), 20).lower()
-    email = _str(data.get('email', ''), 150).lower()
+    phone = _str(data.get('phone', ''), 30)
 
     if plan not in PLAN_PRICES:
         return jsonify({'error': f'Plan invalide. Valeurs acceptées : {list(PLAN_PRICES.keys())}'}), 400
-    if not _is_valid_email(email):
-        return jsonify({'error': 'Email invalide'}), 400
-    if not GENIUSPAY_API_KEY or not GENIUSPAY_API_SECRET:
-        return jsonify({'error': 'Paiement non configuré côté serveur'}), 503
+    if not phone:
+        return jsonify({'error': 'Numéro de téléphone manquant'}), 400
 
-    amount = PLAN_PRICES[plan]
-
-    # Lookup user by email — inscription obligatoire
-    db = get_db()
-    try:
-        with db.cursor() as cur:
-            cur.execute("SELECT id, name FROM users WHERE email = %s", (email,))
-            u = cur.fetchone()
-        if not u:
-            return jsonify({'error': 'Aucun compte trouvé avec cet email. Veuillez créer un compte d\'abord.'}), 404
-        user_id   = u['id']
-        user_name = u['name'] or email.split('@')[0]
-    finally:
-        _return_db(db)
-
-    payload = {
-        'amount':      amount,
-        'currency':    'XOF',
-        'description': f'Abonnement NotifyMails {plan.capitalize()} — 1 mois',
-        'customer':    {'name': user_name, 'email': email},
-        'success_url': f'{FRONTEND_URL}?payment_status=success&plan={plan}&email={email}',
-        'error_url':   f'{FRONTEND_URL}?payment_status=error&plan={plan}',
-        'metadata':    {'user_id': str(user_id), 'plan': plan},
-    }
-    headers = {
-        'X-API-Key':    GENIUSPAY_API_KEY,
-        'X-API-Secret': GENIUSPAY_API_SECRET,
-        'Content-Type': 'application/json',
-    }
-
-    print(f'[GeniusPay] → POST {GENIUSPAY_BASE_URL}/payments | plan={plan} amount={amount} email={email}')
-    try:
-        resp = requests.post(
-            f'{GENIUSPAY_BASE_URL}/payments',
-            json=payload, headers=headers, timeout=25
-        )
-        print(f'[GeniusPay] ← {resp.status_code} ({len(resp.content)} bytes)')
-        if not resp.ok:
-            body = {}
-            try: body = resp.json()
-            except Exception: pass
-            msg = body.get('message') or body.get('error') or f'HTTP {resp.status_code}'
-            print(f'[GeniusPay] initiate {resp.status_code}: {resp.text[:400]}')
-            if resp.status_code == 403:
-                msg = 'Clés API GeniusPay invalides ou compte marchand non activé'
-            elif resp.status_code == 401:
-                msg = 'Authentification GeniusPay échouée — vérifier les clés API'
-            return jsonify({'error': msg}), 502
-        gp = resp.json()
-    except requests.exceptions.ConnectionError:
-        return jsonify({'error': 'Impossible de joindre GeniusPay (connexion refusée)'}), 502
-    except requests.exceptions.Timeout:
-        return jsonify({'error': 'GeniusPay ne répond pas (délai dépassé)'}), 504
-    except requests.exceptions.RequestException as e:
-        print(f'[GeniusPay] Erreur initiate: {e}')
-        return jsonify({'error': 'Erreur de communication avec GeniusPay'}), 502
-
-    if not gp.get('success') or not gp.get('data'):
-        return jsonify({'error': gp.get('message', 'Réponse GeniusPay invalide')}), 502
-
-    reference    = gp['data']['reference']
-    checkout_url = gp['data']['checkout_url']
+    amount   = PLAN_PRICES[plan]
+    wave_url = f"{WAVE_MERCHANT_URL}?amount={amount}"
 
     db = get_db()
     try:
         with db.cursor() as cur:
             cur.execute(
-                "INSERT INTO payments (user_id, plan, amount, status, reference, checkout_url) "
-                "VALUES (%s, %s, %s, 'pending', %s, %s)",
-                (user_id, plan, amount, reference, checkout_url)
+                "INSERT INTO payments (user_id, plan, amount, status, payment_method, phone) "
+                "VALUES (NULL, %s, %s, 'pending', 'wave', %s) RETURNING id",
+                (plan, amount, phone)
             )
+            row = cur.fetchone()
+            payment_id = row['id'] if row else None
         db.commit()
     finally:
         _return_db(db)
 
-    return jsonify({'payment_url': checkout_url, 'tx_id': reference}), 200
-
-
-@app.route('/api/payments/verify', methods=['POST'])
-@limiter.limit("20 per minute")
-def payment_verify():
-    """Vérifie le statut d'un paiement GeniusPay via sa référence. Pas de JWT requis."""
-    data      = request.get_json() or {}
-    reference = _str(data.get('tx_id') or data.get('reference', ''), 60)
-    plan      = _str(data.get('plan', ''), 20).lower()
-    email     = _str(data.get('email', ''), 150).lower()
-
-    if not reference:
-        return jsonify({'error': 'Référence manquante'}), 400
-    if not GENIUSPAY_API_KEY or not GENIUSPAY_API_SECRET:
-        return jsonify({'error': 'Paiement non configuré côté serveur'}), 503
-
-    headers = {
-        'X-API-Key':    GENIUSPAY_API_KEY,
-        'X-API-Secret': GENIUSPAY_API_SECRET,
-        'Content-Type': 'application/json',
-    }
-    try:
-        resp = requests.get(
-            f'{GENIUSPAY_BASE_URL}/payments/{reference}',
-            headers=headers, timeout=15
-        )
-        if not resp.ok:
-            body = {}
-            try: body = resp.json()
-            except Exception: pass
-            msg = body.get('message') or body.get('error') or f'HTTP {resp.status_code}'
-            print(f'[GeniusPay] verify {resp.status_code}: {resp.text[:400]}')
-            if resp.status_code == 403:
-                msg = 'Clés API GeniusPay invalides ou compte marchand non activé'
-            return jsonify({'error': msg}), 502
-        gp = resp.json()
-    except requests.exceptions.ConnectionError:
-        return jsonify({'error': 'Impossible de joindre GeniusPay (connexion refusée)'}), 502
-    except requests.exceptions.Timeout:
-        return jsonify({'error': 'GeniusPay ne répond pas (délai dépassé)'}), 504
-    except requests.exceptions.RequestException as e:
-        print(f'[GeniusPay] Erreur verify: {e}')
-        return jsonify({'error': 'Erreur de communication avec GeniusPay'}), 502
-
-    gp_data = gp.get('data', {})
-    status  = gp_data.get('status', '')
-
-    if status == 'completed' and email and plan:
-        db = get_db()
-        try:
-            with db.cursor() as cur:
-                cur.execute("SELECT id FROM users WHERE email = %s", (email,))
-                u = cur.fetchone()
-                if u:
-                    cur.execute(
-                        "UPDATE users SET plan=%s, plan_expires_at=NOW() + INTERVAL '30 days', "
-                        "plan_renew_sent=FALSE WHERE id=%s",
-                        (plan, u['id'])
-                    )
-                    cur.execute(
-                        "UPDATE payments SET status = 'paid' WHERE reference = %s",
-                        (reference,)
-                    )
-            db.commit()
-        finally:
-            _return_db(db)
-        return jsonify({'status': 'paid', 'plan': plan}), 200
-
-    return jsonify({'status': status}), 200
-
-
-@app.route('/api/webhooks/geniuspay', methods=['POST'])
-def geniuspay_webhook():
-    """Webhook GeniusPay — active le plan utilisateur dès confirmation du paiement."""
-    import hmac as _hmac
-
-    raw_body  = request.get_data()
-    signature = request.headers.get('X-Webhook-Signature', '')
-    timestamp = request.headers.get('X-Webhook-Timestamp', '')
-
-    # Vérification anti-replay (5 minutes max)
-    try:
-        ts = int(timestamp)
-        if abs(time.time() - ts) > 300:
-            return jsonify({'error': 'Timestamp trop ancien'}), 400
-    except (ValueError, TypeError):
-        return jsonify({'error': 'Timestamp invalide'}), 400
-
-    # Vérification signature HMAC-SHA256
-    if GENIUSPAY_WEBHOOK_SECRET:
-        expected = _hmac.new(
-            GENIUSPAY_WEBHOOK_SECRET.encode(),
-            f'{timestamp}.{raw_body.decode()}'.encode(),
-            'sha256'
-        ).hexdigest()
-        if not _hmac.compare_digest(expected, signature):
-            print('[GeniusPay Webhook] Signature invalide')
-            return jsonify({'error': 'Signature invalide'}), 401
-
-    data  = request.get_json() or {}
-    event = data.get('event', '')
-    gp    = data.get('data', {})
-
-    print(f'[GeniusPay Webhook] event={event} ref={gp.get("reference")}')
-
-    if event == 'payment.success' and gp.get('status') == 'completed':
-        meta      = gp.get('metadata', {})
-        user_id   = meta.get('user_id')
-        plan      = meta.get('plan', 'premium')
-        reference = gp.get('reference', '')
-
-        if not user_id:
-            return jsonify({'error': 'user_id manquant dans metadata'}), 400
-
-        db = get_db()
-        try:
-            with db.cursor() as cur:
-                cur.execute(
-                    "UPDATE users SET plan=%s, plan_expires_at=NOW() + INTERVAL '30 days', "
-                    "plan_renew_sent=FALSE WHERE id=%s",
-                    (plan, int(user_id))
-                )
-                cur.execute(
-                    "UPDATE payments SET status = 'paid' WHERE reference = %s",
-                    (reference,)
-                )
-            db.commit()
-            print(f'[GeniusPay Webhook] Plan {plan} activé pour user_id={user_id}, expire dans 30j')
-        finally:
-            _return_db(db)
-
-    return jsonify({'received': True}), 200
+    return jsonify({'payment_id': payment_id, 'wave_url': wave_url, 'amount': amount}), 200
 
 
 @app.route('/api/admin/whatsapp-diagnostic', methods=['GET'])
