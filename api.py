@@ -150,6 +150,10 @@ limiter = Limiter(
     storage_uri="memory://",
 )
 
+@app.errorhandler(429)
+def rate_limit_handler(e):
+    return jsonify({'error': 'Trop de tentatives. Veuillez patienter une minute avant de réessayer.'}), 429
+
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # CORS restreint aux origines connues
@@ -193,17 +197,19 @@ def set_security_headers(response):
 @app.route('/api/<path:path>', methods=['OPTIONS'])
 def handle_options(path):
     """Gère les requêtes preflight OPTIONS avec tous les headers CORS nécessaires"""
-    response = ''
-    # Si c'est une requête preflight, renvoyer les headers CORS
-    if request.method == 'OPTIONS':
-        origin = request.headers.get('Origin', '')
-        if origin in ALLOWED_ORIGINS:
-            response = jsonify({'status': 'preflight'})
-            response.headers['Access-Control-Allow-Origin'] = origin
-            response.headers['Access-Control-Allow-Credentials'] = 'true'
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Cache-Control, Pragma, X-Requested-With, Expires'
-        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS, PATCH'
-        response.headers['Access-Control-Max-Age'] = '86400'
+    origin = request.headers.get('Origin', 'NO_ORIGIN')
+    ua     = request.headers.get('User-Agent', 'NO_UA')[:80]
+    print(f"[OPTIONS] path={path} origin={origin} ua={ua}", flush=True)
+
+    response = jsonify({'status': 'preflight'})
+    if origin in ALLOWED_ORIGINS:
+        response.headers['Access-Control-Allow-Origin']      = origin
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+    response.headers['Access-Control-Allow-Headers'] = (
+        'Content-Type, Authorization, Cache-Control, Pragma, X-Requested-With, Expires'
+    )
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS, PATCH'
+    response.headers['Access-Control-Max-Age']       = '86400'
     return response, 200
 
 SMTP_EMAIL        = os.getenv('SMTP_EMAIL')
@@ -969,21 +975,31 @@ def reset_password():
 @app.route('/api/auth/login', methods=['POST'])
 @limiter.limit("10 per minute")
 def login():
+    origin = request.headers.get('Origin', 'NO_ORIGIN')
+    ua     = request.headers.get('User-Agent', 'NO_UA')[:120]
+    print(f"[LOGIN] origin={origin} ua={ua}", flush=True)
+
     data = request.json
     if not data or not isinstance(data, dict):
+        print(f"[LOGIN] ERREUR: corps JSON manquant", flush=True)
         return jsonify({'error': 'Corps JSON requis'}), 400
 
     email    = _str(data.get('email'), 150).lower()
     password = data.get('password')
 
+    print(f"[LOGIN] email={email} password_len={len(str(password)) if password else 0}", flush=True)
+
     # 400 for genuinely missing fields (form UX)
     if not email:
+        print(f"[LOGIN] ERREUR: email manquant", flush=True)
         return jsonify({'error': 'Email requis'}), 400
     if not password or not isinstance(password, str) or not str(password).strip():
+        print(f"[LOGIN] ERREUR: mot de passe manquant ou vide", flush=True)
         return jsonify({'error': 'Mot de passe requis'}), 400
 
     # Invalid email format or oversized → generic 401 (no enumeration info)
     if not _is_valid_email(email) or len(str(password)) > 128:
+        print(f"[LOGIN] ERREUR: format email invalide ou mdp trop long", flush=True)
         return jsonify({'error': 'Email ou mot de passe incorrect'}), 401
 
     db = get_db()
@@ -993,9 +1009,11 @@ def login():
             user = cur.fetchone()
 
         if not user:
+            print(f"[LOGIN] ERREUR: utilisateur introuvable pour {email}", flush=True)
             return jsonify({'error': 'Email ou mot de passe incorrect'}), 401
-        
+
         if not verify_password(password, user['password']):
+            print(f"[LOGIN] ERREUR: mot de passe incorrect pour {email}", flush=True)
             return jsonify({'error': 'Email ou mot de passe incorrect'}), 401
 
         if user.get('is_banned'):
