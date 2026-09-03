@@ -167,23 +167,26 @@ ALLOWED_ORIGINS = [
     "http://localhost:8080",
     "http://localhost:8081",
 ]
-CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
 
 @app.after_request
 def set_security_headers(response):
     origin = request.headers.get('Origin', '')
 
-    # CORS : uniquement les origines explicitement autorisées — pas de wildcard
-    if origin in ALLOWED_ORIGINS:
-        response.headers['Access-Control-Allow-Origin']      = origin
-        response.headers['Access-Control-Allow-Credentials'] = 'true'
-    # Origines inconnues : aucun header CORS → le navigateur bloquera la requête
+    # CORS — guard: ne pas dupliquer si déjà posé (ex: handle_options)
+    if 'Access-Control-Allow-Origin' not in response.headers:
+        if origin in ALLOWED_ORIGINS:
+            response.headers['Access-Control-Allow-Origin']      = origin
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
 
-    response.headers['Access-Control-Allow-Headers'] = (
-        'Content-Type, Authorization, Cache-Control, Pragma, X-Requested-With, Expires'
-    )
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS, PATCH'
-    response.headers['Access-Control-Max-Age']        = '86400'
+    if 'Access-Control-Allow-Headers' not in response.headers:
+        response.headers['Access-Control-Allow-Headers'] = (
+            'Content-Type, Authorization, Cache-Control, Pragma, X-Requested-With, Expires'
+        )
+    if 'Access-Control-Allow-Methods' not in response.headers:
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS, PATCH'
+    if 'Access-Control-Max-Age' not in response.headers:
+        response.headers['Access-Control-Max-Age'] = '86400'
+
     response.headers['Cache-Control']                 = 'no-store, no-cache, must-revalidate, max-age=0'
     response.headers['Pragma']                        = 'no-cache'
     response.headers['X-Content-Type-Options']        = 'nosniff'
