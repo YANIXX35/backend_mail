@@ -216,7 +216,8 @@ def handle_options(path):
 
 SMTP_EMAIL        = os.getenv('SMTP_EMAIL')
 SMTP_PASSWORD     = os.getenv('SMTP_PASSWORD')
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+TELEGRAM_BOT_TOKEN      = os.getenv('TELEGRAM_BOT_TOKEN')
+ADMIN_TELEGRAM_CHAT_ID  = os.getenv('ADMIN_TELEGRAM_CHAT_ID', '')
 JWT_SECRET_KEY    = os.getenv('JWT_SECRET_KEY')
 if not JWT_SECRET_KEY:
     raise RuntimeError(
@@ -1823,6 +1824,47 @@ def admin_delete_payment(pay_id):
         _return_db(db)
 
 
+def _notify_admin_payment(phone: str, plan: str, amount: int, payment_id: int):
+    """Envoie une notification Telegram à l'admin quand un paiement Wave est soumis."""
+    chat_id = ADMIN_TELEGRAM_CHAT_ID
+    if not chat_id or not TELEGRAM_BOT_TOKEN:
+        # Fallback : cherche le telegram_chat_id du premier admin dans la DB
+        try:
+            db = get_db()
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT telegram_chat_id FROM users WHERE role='admin' "
+                    "AND telegram_chat_id IS NOT NULL LIMIT 1"
+                )
+                row = cur.fetchone()
+                if row:
+                    chat_id = row['telegram_chat_id']
+            _return_db(db)
+        except Exception:
+            pass
+    if not chat_id or not TELEGRAM_BOT_TOKEN:
+        return
+    plan_labels = {'premium': 'Premium — 2 000 XOF', 'enterprise': 'Enterprise — 5 000 XOF'}
+    text = (
+        f"💰 *Nouveau paiement Wave — NotifyMails*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📱 *Téléphone :* `{phone}`\n"
+        f"🎯 *Plan :* {plan_labels.get(plan, plan)}\n"
+        f"💵 *Montant :* {amount} XOF\n"
+        f"🆔 *ID paiement :* #{payment_id}\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Vérifiez dans votre app Wave, puis confirmez dans le dashboard admin."
+    )
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+            timeout=8
+        )
+    except Exception as e:
+        print(f"[Wave] Notification admin Telegram échouée: {e}")
+
+
 # ─── WAVE — PAIEMENTS UTILISATEUR ────────────────────────────────────────────
 
 @app.route('/api/payments/wave', methods=['POST'])
@@ -1857,6 +1899,30 @@ def payment_wave():
         _return_db(db)
 
     return jsonify({'payment_id': payment_id, 'wave_url': wave_url, 'amount': amount}), 200
+
+
+@app.route('/api/payments/wave/<int:payment_id>/paid', methods=['POST'])
+@limiter.limit("10 per minute")
+def payment_wave_user_confirmed(payment_id):
+    """L'utilisateur confirme avoir payé → notifie l'admin Telegram pour vérification."""
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT plan, amount, phone FROM payments WHERE id=%s", (payment_id,))
+            p = cur.fetchone()
+        if not p:
+            return jsonify({'error': 'Paiement introuvable'}), 404
+        p = dict(p)
+    finally:
+        _return_db(db)
+
+    threading.Thread(
+        target=_notify_admin_payment,
+        args=(p['phone'] or '', p['plan'] or '', int(p['amount'] or 0), payment_id),
+        daemon=True
+    ).start()
+
+    return jsonify({'message': 'Confirmation enregistrée — l\'admin vérifie votre paiement'}), 200
 
 
 @app.route('/api/admin/whatsapp-diagnostic', methods=['GET'])
