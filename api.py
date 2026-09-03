@@ -979,9 +979,14 @@ def login():
     ua     = request.headers.get('User-Agent', 'NO_UA')[:120]
     print(f"[LOGIN] origin={origin} ua={ua}", flush=True)
 
-    data = request.json
+    # Accepte JSON et application/x-www-form-urlencoded (mobile sans preflight CORS)
+    ct = request.content_type or ''
+    if 'application/x-www-form-urlencoded' in ct or 'multipart/form-data' in ct:
+        data = request.form.to_dict()
+    else:
+        data = request.json
     if not data or not isinstance(data, dict):
-        print(f"[LOGIN] ERREUR: corps JSON manquant", flush=True)
+        print(f"[LOGIN] ERREUR: corps manquant (ct={ct})", flush=True)
         return jsonify({'error': 'Corps JSON requis'}), 400
 
     email    = _str(data.get('email'), 150).lower()
