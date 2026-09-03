@@ -1840,7 +1840,6 @@ def _notify_admin_payment(phone: str, plan: str, amount: int, payment_id: int):
 
     # Récupère les infos admin depuis la DB
     tg_chat_id  = ADMIN_TELEGRAM_CHAT_ID
-    wa_chat_id  = ''
     admin_phone = ''
     try:
         db = get_db()
@@ -1852,7 +1851,6 @@ def _notify_admin_payment(phone: str, plan: str, amount: int, payment_id: int):
             row = cur.fetchone()
             if row:
                 tg_chat_id  = tg_chat_id or (row['telegram_chat_id'] or '')
-                wa_chat_id  = row['whatsapp_chat_id'] or ''
                 admin_phone = row['phone'] or ''
         _return_db(db)
     except Exception:
@@ -1870,18 +1868,27 @@ def _notify_admin_payment(phone: str, plan: str, amount: int, payment_id: int):
         except Exception as e:
             print(f"[Wave] Telegram admin échoué: {e}")
 
-    # ── WhatsApp (Green API) ───────────────────────────────────────────────────
-    if GREEN_API_INSTANCE and GREEN_API_TOKEN:
-        if not wa_chat_id and admin_phone:
-            phone_clean = re.sub(r'\D', '', admin_phone)
-            wa_chat_id  = f"{phone_clean}@c.us"
-        if wa_chat_id:
+    # ── WhatsApp via Vonage ───────────────────────────────────────────────────
+    if admin_phone and VONAGE_API_KEY and VONAGE_API_SECRET:
+        phone_clean = re.sub(r'\D', '', admin_phone)
+        if phone_clean:
             try:
-                url  = f"{GREEN_API_URL}/waInstance{GREEN_API_INSTANCE}/sendMessage/{GREEN_API_TOKEN}"
-                resp = requests.post(url, json={"chatId": wa_chat_id, "message": msg}, timeout=10)
-                print(f"[Wave] WhatsApp admin → {wa_chat_id} | {resp.status_code}")
+                resp = requests.post(
+                    'https://messages-sandbox.nexmo.com/v1/messages',
+                    json={
+                        "message_type": "text",
+                        "text":         msg,
+                        "to":           phone_clean,
+                        "from":         VONAGE_WA_FROM,
+                        "channel":      "whatsapp"
+                    },
+                    auth=(VONAGE_API_KEY, VONAGE_API_SECRET),
+                    headers={"Content-Type": "application/json", "Accept": "application/json"},
+                    timeout=10
+                )
+                print(f"[Wave] WhatsApp Vonage admin → {phone_clean} | {resp.status_code}")
             except Exception as e:
-                print(f"[Wave] WhatsApp admin échoué: {e}")
+                print(f"[Wave] WhatsApp Vonage admin échoué: {e}")
 
 
 # ─── WAVE — PAIEMENTS UTILISATEUR ────────────────────────────────────────────
