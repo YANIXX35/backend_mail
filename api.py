@@ -573,6 +573,17 @@ def init_db():
             cur.execute("ALTER TABLE payments ALTER COLUMN user_id DROP NOT NULL")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_ref ON payments(reference)")
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS backups (
+                    id SERIAL PRIMARY KEY,
+                    label VARCHAR(100),
+                    size_bytes INT DEFAULT 0,
+                    nb_users INT DEFAULT 0,
+                    nb_payments INT DEFAULT 0,
+                    data TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS whatsapp_email_map (
                     wa_msg_id VARCHAR(100) PRIMARY KEY,
                     user_email VARCHAR(150) NOT NULL,
@@ -5584,11 +5595,164 @@ def _startup():
         threading.Thread(target=_weekly_summary_loop, daemon=True, name="weekly-summary").start()
         print("[STARTUP] Lancement thread vérification expirations abonnements...")
         threading.Thread(target=_plan_expiry_loop, daemon=True, name="plan-expiry").start()
+        print("[STARTUP] Lancement thread backup automatique (toutes les 2h)...")
+        threading.Thread(target=_backup_loop, daemon=True, name="backup").start()
         print("[STARTUP] Tous les threads lances avec succes.")
     except Exception as e:
         import traceback
         print(f"[STARTUP] ERREUR CRITIQUE: {e}")
         traceback.print_exc()
+
+
+# ─── BACKUP AUTOMATIQUE ───────────────────────────────────────────────────────
+
+def _create_backup(label: str = 'auto') -> dict | None:
+    """Exporte les données clés en JSON et les stocke dans la table backups."""
+    import json as _json_mod
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            # Utilisateurs (sans mots de passe ni tokens)
+            cur.execute("""
+                SELECT id, name, email, role, plan, is_verified,
+                       created_at, plan_expires_at, last_login, login_count
+                FROM users ORDER BY id
+            """)
+            users = []
+            for u in cur.fetchall():
+                u = dict(u)
+                for k in ('created_at', 'plan_expires_at', 'last_login'):
+                    if u.get(k): u[k] = u[k].isoformat()
+                users.append(u)
+
+            # Paiements
+            cur.execute("SELECT id, user_id, plan, amount, status, payment_method, phone, created_at FROM payments ORDER BY id")
+            payments = []
+            for p in cur.fetchall():
+                p = dict(p)
+                if p.get('created_at'): p['created_at'] = p['created_at'].isoformat()
+                p['amount'] = float(p['amount'] or 0)
+                payments.append(p)
+
+            # Règles personnalisées
+            cur.execute("SELECT * FROM custom_rules ORDER BY id")
+            rules = [dict(r) for r in cur.fetchall()]
+
+            # Résumé stats
+            cur.execute("SELECT COUNT(*) as total FROM users")
+            total_users = cur.fetchone()['total']
+            cur.execute("SELECT COUNT(*) as total FROM payments WHERE status='paid'")
+            total_paid = cur.fetchone()['total']
+
+        snapshot = {
+            'label':     label,
+            'created_at': datetime.now().isoformat(),
+            'stats':     {'total_users': total_users, 'total_paid_payments': total_paid},
+            'users':     users,
+            'payments':  payments,
+            'custom_rules': rules,
+        }
+        data_str    = _json_mod.dumps(snapshot, ensure_ascii=False, default=str)
+        size_bytes  = len(data_str.encode('utf-8'))
+
+        with db.cursor() as cur:
+            cur.execute(
+                "INSERT INTO backups (label, size_bytes, nb_users, nb_payments, data) "
+                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (label, size_bytes, len(users), len(payments), data_str)
+            )
+            backup_id = cur.fetchone()['id']
+            # Garder seulement les 24 dernières sauvegardes
+            cur.execute(
+                "DELETE FROM backups WHERE id NOT IN "
+                "(SELECT id FROM backups ORDER BY created_at DESC LIMIT 24)"
+            )
+        db.commit()
+        print(f"[Backup] #{backup_id} créé — {len(users)} users, {len(payments)} paiements, {size_bytes//1024}KB")
+        return {'id': backup_id, 'size_bytes': size_bytes, 'nb_users': len(users), 'nb_payments': len(payments)}
+    except Exception as e:
+        print(f"[Backup] Erreur: {e}")
+        return None
+    finally:
+        _return_db(db)
+
+
+def _backup_loop():
+    """Thread qui crée une sauvegarde toutes les 2 heures."""
+    time.sleep(300)  # attendre 5 min au démarrage
+    while True:
+        try:
+            _create_backup('auto')
+        except Exception as e:
+            print(f"[Backup] Loop erreur: {e}")
+        time.sleep(7200)  # 2 heures
+
+
+# ─── ADMIN — BACKUP ENDPOINTS ─────────────────────────────────────────────────
+
+@app.route('/api/admin/backups', methods=['GET'])
+@admin_required
+def admin_list_backups():
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                SELECT id, label, size_bytes, nb_users, nb_payments, created_at
+                FROM backups ORDER BY created_at DESC LIMIT 24
+            """)
+            rows = []
+            for r in cur.fetchall():
+                r = dict(r)
+                if r.get('created_at'): r['created_at'] = r['created_at'].strftime('%Y-%m-%d %H:%M')
+                rows.append(r)
+        return jsonify(rows), 200
+    except:
+        return jsonify([]), 200
+    finally:
+        _return_db(db)
+
+
+@app.route('/api/admin/backups/create', methods=['POST'])
+@admin_required
+def admin_create_backup():
+    result = _create_backup('manuel')
+    if result:
+        return jsonify({'message': 'Sauvegarde créée', **result}), 201
+    return jsonify({'error': 'Erreur lors de la sauvegarde'}), 500
+
+
+@app.route('/api/admin/backups/<int:backup_id>/download', methods=['GET'])
+@admin_required
+def admin_download_backup(backup_id):
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT data, created_at FROM backups WHERE id = %s", (backup_id,))
+            row = cur.fetchone()
+        if not row:
+            return jsonify({'error': 'Sauvegarde introuvable'}), 404
+        ts = row['created_at'].strftime('%Y%m%d_%H%M') if row['created_at'] else 'backup'
+        return Response(
+            row['data'],
+            mimetype='application/json',
+            headers={'Content-Disposition': f'attachment; filename="notifymails_backup_{ts}.json"'}
+        )
+    finally:
+        _return_db(db)
+
+
+@app.route('/api/admin/backups/<int:backup_id>', methods=['DELETE'])
+@admin_required
+def admin_delete_backup(backup_id):
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute("DELETE FROM backups WHERE id = %s", (backup_id,))
+        db.commit()
+        return jsonify({'message': 'Supprimé'}), 200
+    finally:
+        _return_db(db)
+
 
 _startup()
 
