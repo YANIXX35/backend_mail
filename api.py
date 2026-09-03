@@ -1825,44 +1825,63 @@ def admin_delete_payment(pay_id):
 
 
 def _notify_admin_payment(phone: str, plan: str, amount: int, payment_id: int):
-    """Envoie une notification Telegram à l'admin quand un paiement Wave est soumis."""
-    chat_id = ADMIN_TELEGRAM_CHAT_ID
-    if not chat_id or not TELEGRAM_BOT_TOKEN:
-        # Fallback : cherche le telegram_chat_id du premier admin dans la DB
-        try:
-            db = get_db()
-            with db.cursor() as cur:
-                cur.execute(
-                    "SELECT telegram_chat_id FROM users WHERE role='admin' "
-                    "AND telegram_chat_id IS NOT NULL LIMIT 1"
-                )
-                row = cur.fetchone()
-                if row:
-                    chat_id = row['telegram_chat_id']
-            _return_db(db)
-        except Exception:
-            pass
-    if not chat_id or not TELEGRAM_BOT_TOKEN:
-        return
+    """Envoie une notification Telegram + WhatsApp à l'admin quand un paiement Wave est soumis."""
     plan_labels = {'premium': 'Premium — 2 000 XOF', 'enterprise': 'Enterprise — 5 000 XOF'}
-    text = (
+    msg = (
         f"💰 *Nouveau paiement Wave — NotifyMails*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📱 *Téléphone :* `{phone}`\n"
+        f"📱 *Téléphone :* {phone}\n"
         f"🎯 *Plan :* {plan_labels.get(plan, plan)}\n"
         f"💵 *Montant :* {amount} XOF\n"
-        f"🆔 *ID paiement :* #{payment_id}\n\n"
+        f"🆔 *ID :* #{payment_id}\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"✅ Vérifiez dans votre app Wave, puis confirmez dans le dashboard admin."
+        f"✅ Vérifiez sur Wave, puis confirmez dans le dashboard admin."
     )
+
+    # Récupère les infos admin depuis la DB
+    tg_chat_id  = ADMIN_TELEGRAM_CHAT_ID
+    wa_chat_id  = ''
+    admin_phone = ''
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
-            timeout=8
-        )
-    except Exception as e:
-        print(f"[Wave] Notification admin Telegram échouée: {e}")
+        db = get_db()
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT telegram_chat_id, whatsapp_chat_id, phone FROM users "
+                "WHERE role='admin' LIMIT 1"
+            )
+            row = cur.fetchone()
+            if row:
+                tg_chat_id  = tg_chat_id or (row['telegram_chat_id'] or '')
+                wa_chat_id  = row['whatsapp_chat_id'] or ''
+                admin_phone = row['phone'] or ''
+        _return_db(db)
+    except Exception:
+        pass
+
+    # ── Telegram ───────────────────────────────────────────────────────────────
+    if tg_chat_id and TELEGRAM_BOT_TOKEN:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": tg_chat_id, "text": msg, "parse_mode": "Markdown"},
+                timeout=8
+            )
+            print(f"[Wave] Notification Telegram admin envoyée → {tg_chat_id}")
+        except Exception as e:
+            print(f"[Wave] Telegram admin échoué: {e}")
+
+    # ── WhatsApp (Green API) ───────────────────────────────────────────────────
+    if GREEN_API_INSTANCE and GREEN_API_TOKEN:
+        if not wa_chat_id and admin_phone:
+            phone_clean = re.sub(r'\D', '', admin_phone)
+            wa_chat_id  = f"{phone_clean}@c.us"
+        if wa_chat_id:
+            try:
+                url  = f"{GREEN_API_URL}/waInstance{GREEN_API_INSTANCE}/sendMessage/{GREEN_API_TOKEN}"
+                resp = requests.post(url, json={"chatId": wa_chat_id, "message": msg}, timeout=10)
+                print(f"[Wave] WhatsApp admin → {wa_chat_id} | {resp.status_code}")
+            except Exception as e:
+                print(f"[Wave] WhatsApp admin échoué: {e}")
 
 
 # ─── WAVE — PAIEMENTS UTILISATEUR ────────────────────────────────────────────
