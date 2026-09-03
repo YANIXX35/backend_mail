@@ -1839,7 +1839,8 @@ def payment_wave():
         return jsonify({'error': 'Numéro de téléphone manquant'}), 400
 
     amount   = PLAN_PRICES[plan]
-    wave_url = f"{WAVE_MERCHANT_URL}?amount={amount}"
+    # TEST — montant fixé à 100 XOF pour les tests, changer à amount= quand prêt
+    wave_url = f"{WAVE_MERCHANT_URL}?amount=100"
 
     db = get_db()
     try:
